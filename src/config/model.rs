@@ -3,10 +3,21 @@ use std::collections::BTreeMap;
 use super::source::{SourceSpan, Spanned};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Config {
+pub struct ParsedConfig {
+    pub providers: Vec<ParsedProviderConfig>,
     pub parameters: Vec<Parameter>,
-    pub resources: Vec<Resource>,
-    pub data: Vec<Data>,
+    pub resources: Vec<ParsedResource>,
+    pub data: Vec<ParsedData>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedProviderConfig {
+    pub name: Spanned<String>,
+    pub provider_type: Spanned<String>,
+    pub source: Option<Spanned<String>>,
+    pub default: Option<Spanned<bool>>,
+    pub attributes: Attributes,
+    pub span: SourceSpan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -17,7 +28,8 @@ pub struct Parameter {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Resource {
+pub struct ParsedResource {
+    pub provider: Option<Spanned<String>>,
     pub resource_type: Spanned<String>,
     pub name: Spanned<String>,
     pub attributes: Attributes,
@@ -25,7 +37,8 @@ pub struct Resource {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct Data {
+pub struct ParsedData {
+    pub provider: Option<Spanned<String>>,
     pub data_type: Spanned<String>,
     pub name: Spanned<String>,
     pub attributes: Attributes,

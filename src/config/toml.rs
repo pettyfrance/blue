@@ -4,7 +4,10 @@ use std::fmt;
 use std::ops::Range;
 
 use super::expressions::{self, ExpressionError, ExpressionSpanMapper};
-use super::model::{Attribute, Attributes, Config, Data, Expr, ExprKind, Parameter, Resource, Value};
+use super::model::{
+    Attribute, Attributes, Expr, ExprKind, Parameter, ParsedConfig, ParsedData,
+    ParsedProviderConfig, ParsedResource, Value,
+};
 use super::reader::ConfigReader;
 use super::source::{SourceId, SourceSpan, Spanned};
 
@@ -52,7 +55,7 @@ impl From<ExpressionError> for TomlReaderError {
 impl ConfigReader for TomlReader {
     type Error = TomlReaderError;
 
-    fn read(&self, source_id: SourceId, input: &str) -> Result<Config, Self::Error> {
+    fn read(&self, source_id: SourceId, input: &str) -> Result<ParsedConfig, Self::Error> {
         let document = parse_toml_syntax(source_id, input)?;
         build_config(source_id, input, document)
     }
@@ -116,6 +119,16 @@ impl TomlValue {
 struct TomlKeyValue {
     key_path: Vec<Spanned<String>>,
     value: TomlValue,
+    span: SourceSpan,
+}
+
+#[derive(Debug, Clone)]
+struct PendingProviderConfig {
+    name: Spanned<String>,
+    provider_type: Option<Spanned<String>>,
+    source: Option<Spanned<String>>,
+    default: Option<Spanned<bool>>,
+    attributes: Attributes,
     span: SourceSpan,
 }
 
@@ -195,7 +208,9 @@ impl TomlEventParser<'_> {
         })
     }
 
-    fn parse_table_header(&mut self) -> Result<(Vec<Spanned<String>>, SourceSpan), TomlReaderError> {
+    fn parse_table_header(
+        &mut self,
+    ) -> Result<(Vec<Spanned<String>>, SourceSpan), TomlReaderError> {
         use toml_parser::parser::EventKind;
 
         let open = self.expect(EventKind::StdTableOpen)?;
@@ -364,7 +379,10 @@ impl TomlEventParser<'_> {
             values.push(self.parse_value()?);
             self.skip_trivia();
 
-            if matches!(self.peek().map(|event| event.kind()), Some(EventKind::ValueSep)) {
+            if matches!(
+                self.peek().map(|event| event.kind()),
+                Some(EventKind::ValueSep)
+            ) {
                 self.position += 1;
             }
         }
@@ -391,7 +409,10 @@ impl TomlEventParser<'_> {
             attributes.push(self.parse_inline_key_value()?);
             self.skip_trivia();
 
-            if matches!(self.peek().map(|event| event.kind()), Some(EventKind::ValueSep)) {
+            if matches!(
+                self.peek().map(|event| event.kind()),
+                Some(EventKind::ValueSep)
+            ) {
                 self.position += 1;
             }
         }
@@ -498,15 +519,23 @@ fn build_config(
     source_id: SourceId,
     input: &str,
     document: TomlDocument,
-) -> Result<Config, TomlReaderError> {
+) -> Result<ParsedConfig, TomlReaderError> {
+    let mut providers: BTreeMap<String, PendingProviderConfig> = BTreeMap::new();
     let mut parameters: BTreeMap<String, Parameter> = BTreeMap::new();
-    let mut resources: BTreeMap<(String, String), Resource> = BTreeMap::new();
-    let mut data: BTreeMap<(String, String), Data> = BTreeMap::new();
+    let mut resources: BTreeMap<(String, String), ParsedResource> = BTreeMap::new();
+    let mut data: BTreeMap<(String, String), ParsedData> = BTreeMap::new();
 
     for entry in document.entries {
         match entry {
             TomlEntry::Table { path, span } => {
-                apply_table_entry(&mut parameters, &mut resources, &mut data, path, span)?;
+                apply_table_entry(
+                    &mut providers,
+                    &mut parameters,
+                    &mut resources,
+                    &mut data,
+                    path,
+                    span,
+                )?;
             }
             TomlEntry::KeyValue {
                 table_path,
@@ -517,6 +546,7 @@ fn build_config(
                 apply_key_value_entry(
                     source_id,
                     input,
+                    &mut providers,
                     &mut parameters,
                     &mut resources,
                     &mut data,
@@ -529,7 +559,11 @@ fn build_config(
         }
     }
 
-    Ok(Config {
+    Ok(ParsedConfig {
+        providers: providers
+            .into_values()
+            .map(finalize_provider)
+            .collect::<Result<Vec<_>, _>>()?,
         parameters: parameters.into_values().collect(),
         resources: resources.into_values().collect(),
         data: data.into_values().collect(),
@@ -537,13 +571,21 @@ fn build_config(
 }
 
 fn apply_table_entry(
+    providers: &mut BTreeMap<String, PendingProviderConfig>,
     parameters: &mut BTreeMap<String, Parameter>,
-    resources: &mut BTreeMap<(String, String), Resource>,
-    data: &mut BTreeMap<(String, String), Data>,
+    resources: &mut BTreeMap<(String, String), ParsedResource>,
+    data: &mut BTreeMap<(String, String), ParsedData>,
     path: Vec<Spanned<String>>,
     span: SourceSpan,
 ) -> Result<(), TomlReaderError> {
     match path.first().map(|segment| segment.value.as_str()) {
+        Some("provider") => {
+            if path.len() < 2 {
+                return Err(invalid_section(&path, "expected provider.<name>"));
+            }
+            let provider = ensure_provider(providers, &path[1], span);
+            insert_object_path(&mut provider.attributes, &path[2..], span);
+        }
         Some("parameter") => {
             if path.len() < 2 {
                 return Err(invalid_section(&path, "expected parameter.<name>"));
@@ -576,28 +618,74 @@ fn apply_table_entry(
 fn apply_key_value_entry(
     source_id: SourceId,
     input: &str,
+    providers: &mut BTreeMap<String, PendingProviderConfig>,
     parameters: &mut BTreeMap<String, Parameter>,
-    resources: &mut BTreeMap<(String, String), Resource>,
-    data: &mut BTreeMap<(String, String), Data>,
+    resources: &mut BTreeMap<(String, String), ParsedResource>,
+    data: &mut BTreeMap<(String, String), ParsedData>,
     table_path: Vec<Spanned<String>>,
     key_path: Vec<Spanned<String>>,
     value: TomlValue,
     span: SourceSpan,
 ) -> Result<(), TomlReaderError> {
     match table_path.first().map(|segment| segment.value.as_str()) {
+        Some("provider") => {
+            if table_path.len() < 2 {
+                return Err(invalid_section(&table_path, "expected provider.<name>"));
+            }
+            let provider = ensure_provider(providers, &table_path[1], table_path_span(&table_path));
+            let mut attribute_path = table_path[2..].to_vec();
+            attribute_path.extend(key_path);
+
+            if attribute_path.len() == 1 && attribute_path[0].value == "type" {
+                provider.provider_type = Some(toml_value_to_static_string(
+                    source_id,
+                    input,
+                    value,
+                    "provider type",
+                )?);
+            } else if attribute_path.len() == 1 && attribute_path[0].value == "source" {
+                provider.source = Some(toml_value_to_static_string(
+                    source_id,
+                    input,
+                    value,
+                    "provider source",
+                )?);
+            } else if attribute_path.len() == 1 && attribute_path[0].value == "default" {
+                provider.default = Some(toml_value_to_static_bool(value, "provider default")?);
+            } else {
+                let attribute = toml_value_to_attribute(
+                    source_id,
+                    input,
+                    attribute_path.last().unwrap(),
+                    value,
+                    span,
+                )?;
+                insert_attribute_path(&mut provider.attributes, &attribute_path, attribute);
+            }
+        }
         Some("parameter") => {
             if table_path.len() < 2 {
                 return Err(invalid_section(&table_path, "expected parameter.<name>"));
             }
-            let parameter = ensure_parameter(parameters, &table_path[1], table_path_span(&table_path));
+            let parameter =
+                ensure_parameter(parameters, &table_path[1], table_path_span(&table_path));
             let mut attribute_path = table_path[2..].to_vec();
             attribute_path.extend(key_path);
-            let attribute = toml_value_to_attribute(source_id, input, attribute_path.last().unwrap(), value, span)?;
+            let attribute = toml_value_to_attribute(
+                source_id,
+                input,
+                attribute_path.last().unwrap(),
+                value,
+                span,
+            )?;
             insert_attribute_path(&mut parameter.attributes, &attribute_path, attribute);
         }
         Some("resource") => {
             if table_path.len() < 3 {
-                return Err(invalid_section(&table_path, "expected resource.<type>.<name>"));
+                return Err(invalid_section(
+                    &table_path,
+                    "expected resource.<type>.<name>",
+                ));
             }
             let resource = ensure_resource(
                 resources,
@@ -607,8 +695,23 @@ fn apply_key_value_entry(
             );
             let mut attribute_path = table_path[3..].to_vec();
             attribute_path.extend(key_path);
-            let attribute = toml_value_to_attribute(source_id, input, attribute_path.last().unwrap(), value, span)?;
-            insert_attribute_path(&mut resource.attributes, &attribute_path, attribute);
+            if attribute_path.len() == 1 && attribute_path[0].value == "provider" {
+                resource.provider = Some(toml_value_to_static_string(
+                    source_id,
+                    input,
+                    value,
+                    "resource provider",
+                )?);
+            } else {
+                let attribute = toml_value_to_attribute(
+                    source_id,
+                    input,
+                    attribute_path.last().unwrap(),
+                    value,
+                    span,
+                )?;
+                insert_attribute_path(&mut resource.attributes, &attribute_path, attribute);
+            }
         }
         Some("data") => {
             if table_path.len() < 3 {
@@ -622,19 +725,72 @@ fn apply_key_value_entry(
             );
             let mut attribute_path = table_path[3..].to_vec();
             attribute_path.extend(key_path);
-            let attribute = toml_value_to_attribute(source_id, input, attribute_path.last().unwrap(), value, span)?;
-            insert_attribute_path(&mut data.attributes, &attribute_path, attribute);
+            if attribute_path.len() == 1 && attribute_path[0].value == "provider" {
+                data.provider = Some(toml_value_to_static_string(
+                    source_id,
+                    input,
+                    value,
+                    "data provider",
+                )?);
+            } else {
+                let attribute = toml_value_to_attribute(
+                    source_id,
+                    input,
+                    attribute_path.last().unwrap(),
+                    value,
+                    span,
+                )?;
+                insert_attribute_path(&mut data.attributes, &attribute_path, attribute);
+            }
         }
         Some(other) => return Err(TomlReaderError::UnknownTopLevelSection(other.to_owned())),
         None => {
             return Err(TomlReaderError::InvalidSection {
                 section: "root".into(),
-                message: "key/value pairs must be inside parameter/resource/data sections".into(),
+                message: "key/value pairs must be inside provider/parameter/resource/data sections"
+                    .into(),
             });
         }
     }
 
     Ok(())
+}
+
+fn ensure_provider<'a>(
+    providers: &'a mut BTreeMap<String, PendingProviderConfig>,
+    name: &Spanned<String>,
+    span: SourceSpan,
+) -> &'a mut PendingProviderConfig {
+    providers
+        .entry(name.value.clone())
+        .or_insert_with(|| PendingProviderConfig {
+            name: name.clone(),
+            provider_type: None,
+            source: None,
+            default: None,
+            attributes: BTreeMap::new(),
+            span,
+        })
+}
+
+fn finalize_provider(
+    provider: PendingProviderConfig,
+) -> Result<ParsedProviderConfig, TomlReaderError> {
+    let provider_type = provider
+        .provider_type
+        .ok_or_else(|| TomlReaderError::InvalidSection {
+            section: format!("provider.{}", provider.name.value),
+            message: "missing required `type` attribute".into(),
+        })?;
+
+    Ok(ParsedProviderConfig {
+        name: provider.name,
+        provider_type,
+        source: provider.source,
+        default: provider.default,
+        attributes: provider.attributes,
+        span: provider.span,
+    })
 }
 
 fn ensure_parameter<'a>(
@@ -652,14 +808,15 @@ fn ensure_parameter<'a>(
 }
 
 fn ensure_resource<'a>(
-    resources: &'a mut BTreeMap<(String, String), Resource>,
+    resources: &'a mut BTreeMap<(String, String), ParsedResource>,
     resource_type: &Spanned<String>,
     name: &Spanned<String>,
     span: SourceSpan,
-) -> &'a mut Resource {
+) -> &'a mut ParsedResource {
     resources
         .entry((resource_type.value.clone(), name.value.clone()))
-        .or_insert_with(|| Resource {
+        .or_insert_with(|| ParsedResource {
+            provider: None,
             resource_type: resource_type.clone(),
             name: name.clone(),
             attributes: BTreeMap::new(),
@@ -668,13 +825,14 @@ fn ensure_resource<'a>(
 }
 
 fn ensure_data<'a>(
-    data: &'a mut BTreeMap<(String, String), Data>,
+    data: &'a mut BTreeMap<(String, String), ParsedData>,
     data_type: &Spanned<String>,
     name: &Spanned<String>,
     span: SourceSpan,
-) -> &'a mut Data {
+) -> &'a mut ParsedData {
     data.entry((data_type.value.clone(), name.value.clone()))
-        .or_insert_with(|| Data {
+        .or_insert_with(|| ParsedData {
+            provider: None,
             data_type: data_type.clone(),
             name: name.clone(),
             attributes: BTreeMap::new(),
@@ -688,18 +846,24 @@ fn insert_object_path(attributes: &mut Attributes, path: &[Spanned<String>], spa
     }
 
     let key = path[0].clone();
-    let entry = attributes.entry(key.value.clone()).or_insert_with(|| Attribute {
-        name: key,
-        value: Spanned::new(ExprKind::Literal(Value::Object(BTreeMap::new())), span),
-        span,
-    });
+    let entry = attributes
+        .entry(key.value.clone())
+        .or_insert_with(|| Attribute {
+            name: key,
+            value: Spanned::new(ExprKind::Literal(Value::Object(BTreeMap::new())), span),
+            span,
+        });
 
     if let ExprKind::Literal(Value::Object(children)) = &mut entry.value.value {
         insert_object_path(children, &path[1..], span);
     }
 }
 
-fn insert_attribute_path(attributes: &mut Attributes, path: &[Spanned<String>], attribute: Attribute) {
+fn insert_attribute_path(
+    attributes: &mut Attributes,
+    path: &[Spanned<String>],
+    attribute: Attribute,
+) {
     if path.is_empty() {
         return;
     }
@@ -710,14 +874,16 @@ fn insert_attribute_path(attributes: &mut Attributes, path: &[Spanned<String>], 
     }
 
     let key = path[0].clone();
-    let entry = attributes.entry(key.value.clone()).or_insert_with(|| Attribute {
-        name: key,
-        value: Spanned::new(
-            ExprKind::Literal(Value::Object(BTreeMap::new())),
-            attribute.span,
-        ),
-        span: attribute.span,
-    });
+    let entry = attributes
+        .entry(key.value.clone())
+        .or_insert_with(|| Attribute {
+            name: key,
+            value: Spanned::new(
+                ExprKind::Literal(Value::Object(BTreeMap::new())),
+                attribute.span,
+            ),
+            span: attribute.span,
+        });
 
     if let ExprKind::Literal(Value::Object(children)) = &mut entry.value.value {
         insert_attribute_path(children, &path[1..], attribute);
@@ -736,6 +902,40 @@ fn toml_value_to_attribute(
         value: toml_value_to_expr(source_id, input, value)?,
         span,
     })
+}
+
+fn toml_value_to_static_string(
+    source_id: SourceId,
+    input: &str,
+    value: TomlValue,
+    description: &str,
+) -> Result<Spanned<String>, TomlReaderError> {
+    let expr = toml_value_to_expr(source_id, input, value)?;
+
+    match expr.value {
+        ExprKind::Literal(Value::String(value)) => Ok(Spanned::new(value, expr.span)),
+        _ => Err(TomlReaderError::InvalidSection {
+            section: "provider".into(),
+            message: format!("{description} must be a literal string"),
+        }),
+    }
+}
+
+fn toml_value_to_static_bool(
+    value: TomlValue,
+    description: &str,
+) -> Result<Spanned<bool>, TomlReaderError> {
+    match value {
+        TomlValue::Bool(value) => Ok(value),
+        other => Err(TomlReaderError::InvalidSection {
+            section: "provider".into(),
+            message: format!(
+                "{description} must be a literal bool at {}..{}",
+                other.span().span.start,
+                other.span().span.end
+            ),
+        }),
+    }
 }
 
 fn toml_value_to_expr(
@@ -799,9 +999,18 @@ fn toml_value_to_expr(
 }
 
 fn table_path_span(path: &[Spanned<String>]) -> SourceSpan {
-    let source = path.first().map(|segment| segment.span.source).unwrap_or(SourceId::SYNTHETIC);
-    let start = path.first().map(|segment| segment.span.span.start).unwrap_or(0);
-    let end = path.last().map(|segment| segment.span.span.end).unwrap_or(start);
+    let source = path
+        .first()
+        .map(|segment| segment.span.source)
+        .unwrap_or(SourceId::SYNTHETIC);
+    let start = path
+        .first()
+        .map(|segment| segment.span.span.start)
+        .unwrap_or(0);
+    let end = path
+        .last()
+        .map(|segment| segment.span.span.end)
+        .unwrap_or(start);
     SourceSpan::new(source, start, end)
 }
 
@@ -843,12 +1052,11 @@ impl TomlStringSpanMapper {
 
 impl ExpressionSpanMapper for TomlStringSpanMapper {
     fn span(&self, start: usize, end: usize) -> SourceSpan {
-        let start = self.boundaries.get(start).copied().unwrap_or_else(|| {
-            self.boundaries
-                .last()
-                .copied()
-                .unwrap_or_default()
-        });
+        let start = self
+            .boundaries
+            .get(start)
+            .copied()
+            .unwrap_or_else(|| self.boundaries.last().copied().unwrap_or_default());
         let end = self.boundaries.get(end).copied().unwrap_or(start);
 
         SourceSpan::new(self.source_id, start, end)
@@ -858,7 +1066,9 @@ impl ExpressionSpanMapper for TomlStringSpanMapper {
 fn simple_string_boundaries(decoded: &str, raw: &str, raw_start: usize) -> Vec<usize> {
     let content = string_content_range(raw, raw_start)
         .unwrap_or_else(|| raw_start + 1..raw_start + raw.len().saturating_sub(1));
-    (0..=decoded.len()).map(|offset| content.start + offset).collect()
+    (0..=decoded.len())
+        .map(|offset| content.start + offset)
+        .collect()
 }
 
 fn string_content_range(raw: &str, raw_start: usize) -> Option<Range<usize>> {
@@ -876,17 +1086,18 @@ fn string_content_range(raw: &str, raw_start: usize) -> Option<Range<usize>> {
 }
 
 fn build_toml_string_boundaries(decoded: &str, raw: &str, raw_start: usize) -> Option<Vec<usize>> {
-    let (content_start, content_end, literal, multiline) = if raw.starts_with("\"\"\"") && raw.ends_with("\"\"\"") && raw.len() >= 6 {
-        (3, raw.len() - 3, false, true)
-    } else if raw.starts_with("'''") && raw.ends_with("'''") && raw.len() >= 6 {
-        (3, raw.len() - 3, true, true)
-    } else if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
-        (1, raw.len() - 1, false, false)
-    } else if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
-        (1, raw.len() - 1, true, false)
-    } else {
-        return None;
-    };
+    let (content_start, content_end, literal, multiline) =
+        if raw.starts_with("\"\"\"") && raw.ends_with("\"\"\"") && raw.len() >= 6 {
+            (3, raw.len() - 3, false, true)
+        } else if raw.starts_with("'''") && raw.ends_with("'''") && raw.len() >= 6 {
+            (3, raw.len() - 3, true, true)
+        } else if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
+            (1, raw.len() - 1, false, false)
+        } else if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+            (1, raw.len() - 1, true, false)
+        } else {
+            return None;
+        };
 
     let raw_bytes = raw.as_bytes();
     let mut index = content_start;
@@ -916,7 +1127,10 @@ fn build_toml_string_boundaries(decoded: &str, raw: &str, raw_start: usize) -> O
                 return None;
             }
 
-            if multiline && (raw[index..content_end].starts_with("\r\n") || raw[index..content_end].starts_with('\n')) {
+            if multiline
+                && (raw[index..content_end].starts_with("\r\n")
+                    || raw[index..content_end].starts_with('\n'))
+            {
                 if raw[index..content_end].starts_with("\r\n") {
                     index += 2;
                 } else {
@@ -1054,7 +1268,7 @@ mod tests {
     use super::*;
     use crate::config::model::{ExprKind, TemplatePart};
 
-    fn read(input: &str) -> Config {
+    fn read(input: &str) -> ParsedConfig {
         TomlReader.read(SourceId(0), input).unwrap()
     }
 
@@ -1077,6 +1291,87 @@ mod tests {
         let config = TomlReader.read(SourceId(0), input).unwrap();
 
         dbg!(config);
+    }
+
+    #[test]
+    fn reads_provider_config() {
+        let input = "[provider.blue]\ntype = \"blue\"\n";
+        let config = read(input);
+
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].name.value, "blue");
+        assert_eq!(config.providers[0].provider_type.value, "blue");
+        assert_eq!(config.providers[0].source, None);
+        assert!(config.providers[0].attributes.is_empty());
+    }
+
+    #[test]
+    fn provider_reserved_fields_are_not_attributes() {
+        let input =
+            "[provider.aws]\ntype = \"aws\"\nsource = \"builtin\"\nregion = \"us-east-1\"\n";
+        let config = read(input);
+        let provider = &config.providers[0];
+
+        assert_eq!(provider.provider_type.value, "aws");
+        assert_eq!(provider.source.as_ref().unwrap().value, "builtin");
+        assert!(!provider.attributes.contains_key("type"));
+        assert!(!provider.attributes.contains_key("source"));
+        assert!(provider.attributes.contains_key("region"));
+    }
+
+    #[test]
+    fn provider_default_is_not_an_attribute() {
+        let input = "[provider.blue]\ntype = \"blue\"\ndefault = true\nregion = \"local\"\n";
+        let config = read(input);
+        let provider = &config.providers[0];
+
+        assert_eq!(provider.default.as_ref().unwrap().value, true);
+        assert!(!provider.attributes.contains_key("default"));
+        assert!(provider.attributes.contains_key("region"));
+    }
+
+    #[test]
+    fn provider_default_must_be_bool() {
+        let input = "[provider.blue]\ntype = \"blue\"\ndefault = \"yes\"\n";
+        let err = TomlReader.read(SourceId(0), input).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("provider default must be a literal bool")
+        );
+    }
+
+    #[test]
+    fn resource_provider_is_not_an_attribute() {
+        let input = "[resource.file.config]\nprovider = \"blue\"\npath = \"/tmp/config\"\n";
+        let config = read(input);
+        let resource = &config.resources[0];
+
+        assert_eq!(resource.provider.as_ref().unwrap().value, "blue");
+        assert!(!resource.attributes.contains_key("provider"));
+        assert!(resource.attributes.contains_key("path"));
+    }
+
+    #[test]
+    fn data_provider_is_not_an_attribute() {
+        let input = "[data.script.setup]\nprovider = \"blue\"\nscript = \"setup.js\"\n";
+        let config = read(input);
+        let data = &config.data[0];
+
+        assert_eq!(data.provider.as_ref().unwrap().value, "blue");
+        assert!(!data.attributes.contains_key("provider"));
+        assert!(data.attributes.contains_key("script"));
+    }
+
+    #[test]
+    fn provider_requires_type() {
+        let input = "[provider.blue]\n";
+        let err = TomlReader.read(SourceId(0), input).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("missing required `type` attribute")
+        );
     }
 
     #[test]
@@ -1164,7 +1459,11 @@ name = "line\n{{ parameter.environment }}"
 
         assert_eq!(
             reference.path[0].span,
-            SourceSpan::new(SourceId(0), parameter_start, parameter_start + "parameter".len())
+            SourceSpan::new(
+                SourceId(0),
+                parameter_start,
+                parameter_start + "parameter".len()
+            )
         );
         assert_eq!(
             reference.path[1].span,

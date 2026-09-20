@@ -54,7 +54,11 @@ impl SimpleExpressionSpanMapper {
 
 impl ExpressionSpanMapper for SimpleExpressionSpanMapper {
     fn span(&self, start: usize, end: usize) -> SourceSpan {
-        SourceSpan::new(self.source_id, self.base_offset + start, self.base_offset + end)
+        SourceSpan::new(
+            self.source_id,
+            self.base_offset + start,
+            self.base_offset + end,
+        )
     }
 }
 
@@ -174,7 +178,9 @@ pub fn parse_string(
     if parts.len() == 1 {
         match parts.remove(0) {
             TemplatePart::Expr(expr) => Ok(*expr),
-            TemplatePart::Literal(value) => Ok(value.map(|value| ExprKind::Literal(Value::String(value)))),
+            TemplatePart::Literal(value) => {
+                Ok(value.map(|value| ExprKind::Literal(Value::String(value))))
+            }
         }
     } else {
         Ok(Spanned::new(
@@ -256,12 +262,9 @@ mod tests {
         let value = match expr.value {
             ExprKind::Literal(value) => ExprKind::Literal(normalize_value(value)),
             ExprKind::Reference(reference) => ExprKind::Reference(normalize_reference(reference)),
-            ExprKind::Template(parts) => ExprKind::Template(
-                parts
-                    .into_iter()
-                    .map(normalize_template_part)
-                    .collect(),
-            ),
+            ExprKind::Template(parts) => {
+                ExprKind::Template(parts.into_iter().map(normalize_template_part).collect())
+            }
         };
 
         Spanned::synthetic(value)
