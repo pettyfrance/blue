@@ -1,0 +1,13 @@
+[parameter.db_size]
+default = 20
+
+[parameter.environment]
+default = "prod"
+
+[resource.database.main]
+size = "{{ parameter.db_size }}"
+name = "db-{{ parameter.environment }}"
+
+[resource.server.main.labels]
+env = "{{ parameter.environment }}"
+app = "web"
