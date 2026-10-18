@@ -1,3 +1,5 @@
+use std::fmt;
+
 use super::model::{DesiredGraph, EdgeKind, GraphNode, GraphNodeKind, NodeId};
 use crate::config::{Attributes, Config, Reference, SourceSpan};
 
@@ -7,7 +9,31 @@ pub struct DesiredGraphBuilder;
 pub enum GraphBuildError {
     MalformedReference { path: Vec<String>, span: SourceSpan },
     UnknownReference { path: Vec<String>, span: SourceSpan },
+    Cycle { path: Vec<NodeId> },
 }
+
+impl fmt::Display for GraphBuildError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MalformedReference { path, .. } => {
+                write!(f, "malformed reference `{}`", format_reference_path(path))
+            }
+            Self::UnknownReference { path, .. } => {
+                write!(f, "unknown reference `{}`", format_reference_path(path))
+            }
+            Self::Cycle { path } => write!(
+                f,
+                "dependency cycle detected: {}",
+                path.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GraphBuildError {}
 
 impl DesiredGraphBuilder {
     pub fn build(config: &Config) -> Result<DesiredGraph, Vec<GraphBuildError>> {
@@ -74,6 +100,13 @@ impl DesiredGraphBuilder {
             );
         }
 
+        for provider in &config.providers {
+            let owner = NodeId::Provider {
+                name: provider.name.value.clone(),
+            };
+            add_reference_edges(&mut graph, &owner, &provider.attributes, &mut errors);
+        }
+
         for parameter in &config.parameters {
             let owner = NodeId::Parameter {
                 name: parameter.name.value.clone(),
@@ -95,6 +128,10 @@ impl DesiredGraphBuilder {
                 name: resource.name.value.clone(),
             };
             add_reference_edges(&mut graph, &owner, &resource.attributes, &mut errors);
+        }
+
+        if let Some(path) = graph.find_cycle() {
+            errors.push(GraphBuildError::Cycle { path });
         }
 
         if errors.is_empty() {
@@ -153,6 +190,14 @@ fn reference_to_node_id(reference: &Reference) -> Result<NodeId, GraphBuildError
             name: path[2].clone(),
         }),
         _ => Err(GraphBuildError::MalformedReference { path, span }),
+    }
+}
+
+fn format_reference_path(path: &[String]) -> String {
+    if path.is_empty() {
+        "<empty>".into()
+    } else {
+        path.join(".")
     }
 }
 
@@ -394,6 +439,31 @@ mod tests {
     }
 
     #[test]
+    fn deduplicates_duplicate_edges() {
+        let mut config = config();
+        config.resources[0].attributes = attrs(vec![
+            ("content_a", reference(&["parameter", "content"])),
+            ("content_b", reference(&["parameter", "content"])),
+        ]);
+
+        let graph = DesiredGraphBuilder::build(&config).unwrap();
+
+        assert_eq!(
+            graph.edge_count_between(
+                &NodeId::Parameter {
+                    name: "content".into()
+                },
+                &NodeId::Resource {
+                    resource_type: "file".into(),
+                    name: "config".into(),
+                },
+                &EdgeKind::Reference,
+            ),
+            1
+        );
+    }
+
+    #[test]
     fn finds_references_in_nested_array_and_object_values() {
         let mut nested = BTreeMap::new();
         nested.insert(
@@ -464,6 +534,212 @@ mod tests {
             errors[0],
             GraphBuildError::MalformedReference { .. }
         ));
+    }
+
+    #[test]
+    fn formats_node_ids() {
+        assert_eq!(
+            NodeId::Provider {
+                name: "blue".into()
+            }
+            .to_string(),
+            "provider.blue"
+        );
+        assert_eq!(
+            NodeId::Parameter {
+                name: "content".into()
+            }
+            .to_string(),
+            "parameter.content"
+        );
+        assert_eq!(
+            NodeId::Data {
+                data_type: "script".into(),
+                name: "setup".into(),
+            }
+            .to_string(),
+            "data.script.setup"
+        );
+        assert_eq!(
+            NodeId::Resource {
+                resource_type: "file".into(),
+                name: "config".into(),
+            }
+            .to_string(),
+            "resource.file.config"
+        );
+    }
+
+    #[test]
+    fn formats_graph_build_errors() {
+        assert_eq!(
+            GraphBuildError::MalformedReference {
+                path: vec!["resource".into(), "file".into()],
+                span: SourceSpan::SYNTHETIC,
+            }
+            .to_string(),
+            "malformed reference `resource.file`"
+        );
+        assert_eq!(
+            GraphBuildError::UnknownReference {
+                path: vec!["parameter".into(), "missing".into()],
+                span: SourceSpan::SYNTHETIC,
+            }
+            .to_string(),
+            "unknown reference `parameter.missing`"
+        );
+        assert_eq!(
+            GraphBuildError::Cycle {
+                path: vec![
+                    NodeId::Resource {
+                        resource_type: "file".into(),
+                        name: "a".into(),
+                    },
+                    NodeId::Resource {
+                        resource_type: "file".into(),
+                        name: "b".into(),
+                    },
+                    NodeId::Resource {
+                        resource_type: "file".into(),
+                        name: "a".into(),
+                    },
+                ],
+            }
+            .to_string(),
+            "dependency cycle detected: resource.file.a -> resource.file.b -> resource.file.a"
+        );
+    }
+
+    #[test]
+    fn topological_order_places_dependencies_before_dependents() {
+        let mut config = config();
+        config.resources[0].attributes =
+            attrs(vec![("script", reference(&["data", "script", "setup"]))]);
+        config.data[0].attributes = attrs(vec![("content", reference(&["parameter", "content"]))]);
+
+        let graph = DesiredGraphBuilder::build(&config).unwrap();
+        let order = graph.topological_order().unwrap();
+
+        let provider = order
+            .iter()
+            .position(|id| {
+                id == &NodeId::Provider {
+                    name: "blue".into(),
+                }
+            })
+            .unwrap();
+        let parameter = order
+            .iter()
+            .position(|id| {
+                id == &NodeId::Parameter {
+                    name: "content".into(),
+                }
+            })
+            .unwrap();
+        let data = order
+            .iter()
+            .position(|id| {
+                id == &NodeId::Data {
+                    data_type: "script".into(),
+                    name: "setup".into(),
+                }
+            })
+            .unwrap();
+        let resource = order
+            .iter()
+            .position(|id| {
+                id == &NodeId::Resource {
+                    resource_type: "file".into(),
+                    name: "config".into(),
+                }
+            })
+            .unwrap();
+
+        assert!(provider < data);
+        assert!(provider < resource);
+        assert!(parameter < data);
+        assert!(data < resource);
+    }
+
+    #[test]
+    fn topological_order_returns_cycle_path() {
+        let mut graph = DesiredGraph::new();
+        let a = NodeId::Resource {
+            resource_type: "file".into(),
+            name: "a".into(),
+        };
+        let b = NodeId::Resource {
+            resource_type: "file".into(),
+            name: "b".into(),
+        };
+        graph.add_node(GraphNode {
+            id: a.clone(),
+            kind: GraphNodeKind::Resource {
+                provider: "blue".into(),
+            },
+        });
+        graph.add_node(GraphNode {
+            id: b.clone(),
+            kind: GraphNodeKind::Resource {
+                provider: "blue".into(),
+            },
+        });
+        graph.add_edge(&a, &b, EdgeKind::Reference);
+        graph.add_edge(&b, &a, EdgeKind::Reference);
+
+        let cycle = graph.topological_order().unwrap_err();
+
+        assert_eq!(cycle.first(), cycle.last());
+        assert!(cycle.contains(&a));
+        assert!(cycle.contains(&b));
+    }
+
+    #[test]
+    fn acyclic_graph_succeeds() {
+        let mut config = config();
+        config.resources.push(Resource {
+            provider: spanned("blue"),
+            resource_type: spanned("file"),
+            name: spanned("other"),
+            attributes: attrs(vec![("path", reference(&["resource", "file", "config"]))]),
+            span: SourceSpan::SYNTHETIC,
+        });
+
+        assert!(DesiredGraphBuilder::build(&config).is_ok());
+    }
+
+    #[test]
+    fn cycle_errors_with_full_path() {
+        let mut config = config();
+        config.resources[0].attributes =
+            attrs(vec![("path", reference(&["resource", "file", "other"]))]);
+        config.resources.push(Resource {
+            provider: spanned("blue"),
+            resource_type: spanned("file"),
+            name: spanned("other"),
+            attributes: attrs(vec![("path", reference(&["resource", "file", "config"]))]),
+            span: SourceSpan::SYNTHETIC,
+        });
+
+        let errors = DesiredGraphBuilder::build(&config).unwrap_err();
+        let cycle = errors
+            .iter()
+            .find_map(|error| match error {
+                GraphBuildError::Cycle { path } => Some(path),
+                _ => None,
+            })
+            .expect("expected cycle error");
+
+        assert_eq!(cycle.first(), cycle.last());
+        assert!(cycle.contains(&NodeId::Resource {
+            resource_type: "file".into(),
+            name: "config".into(),
+        }));
+        assert!(cycle.contains(&NodeId::Resource {
+            resource_type: "file".into(),
+            name: "other".into(),
+        }));
+        assert_eq!(cycle.len(), 3);
     }
 
     #[test]

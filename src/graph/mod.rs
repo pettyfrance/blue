@@ -1,3 +1,4 @@
+pub(crate) mod algorithms;
 pub mod builder;
 pub mod model;
 

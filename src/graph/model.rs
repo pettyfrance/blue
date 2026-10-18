@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
+use petgraph::Direction;
+use petgraph::algo::toposort;
 use petgraph::stable_graph::{NodeIndex, StableDiGraph};
 use petgraph::visit::EdgeRef;
 
@@ -9,6 +12,20 @@ pub enum NodeId {
     Parameter { name: String },
     Data { data_type: String, name: String },
     Resource { resource_type: String, name: String },
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Provider { name } => write!(f, "provider.{name}"),
+            Self::Parameter { name } => write!(f, "parameter.{name}"),
+            Self::Data { data_type, name } => write!(f, "data.{data_type}.{name}"),
+            Self::Resource {
+                resource_type,
+                name,
+            } => write!(f, "resource.{resource_type}.{name}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +77,15 @@ impl DesiredGraph {
     pub fn add_edge(&mut self, from: &NodeId, to: &NodeId, kind: EdgeKind) -> Option<()> {
         let from = self.node_indices.get(from).copied()?;
         let to = self.node_indices.get(to).copied()?;
+
+        if self
+            .graph
+            .edges(from)
+            .any(|edge| edge.target() == to && edge.weight() == &kind)
+        {
+            return Some(());
+        }
+
         self.graph.add_edge(from, to, kind);
         Some(())
     }
@@ -83,16 +109,21 @@ impl DesiredGraph {
     }
 
     pub fn has_edge(&self, from: &NodeId, to: &NodeId, kind: &EdgeKind) -> bool {
+        self.edge_count_between(from, to, kind) > 0
+    }
+
+    pub fn edge_count_between(&self, from: &NodeId, to: &NodeId, kind: &EdgeKind) -> usize {
         let Some(from) = self.node_indices.get(from).copied() else {
-            return false;
+            return 0;
         };
         let Some(to) = self.node_indices.get(to).copied() else {
-            return false;
+            return 0;
         };
 
         self.graph
             .edges(from)
-            .any(|edge| edge.target() == to && edge.weight() == kind)
+            .filter(|edge| edge.target() == to && edge.weight() == kind)
+            .count()
     }
 
     pub fn graph(&self) -> &StableDiGraph<GraphNode, EdgeKind> {
@@ -101,6 +132,42 @@ impl DesiredGraph {
 
     pub fn node_indices(&self) -> &BTreeMap<NodeId, NodeIndex> {
         &self.node_indices
+    }
+
+    pub fn topological_order(&self) -> Result<Vec<NodeId>, Vec<NodeId>> {
+        match toposort(&self.graph, None) {
+            Ok(order) => Ok(order
+                .into_iter()
+                .filter_map(|index| self.graph.node_weight(index))
+                .map(|node| node.id.clone())
+                .collect()),
+            Err(_) => Err(self.find_cycle().unwrap_or_default()),
+        }
+    }
+
+    pub fn dependencies_of(&self, node: &NodeId) -> Vec<NodeId> {
+        let Some(index) = self.node_indices.get(node).copied() else {
+            return Vec::new();
+        };
+
+        let mut dependencies = self
+            .graph
+            .edges_directed(index, Direction::Incoming)
+            .filter_map(|edge| self.graph.node_weight(edge.source()))
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        dependencies.sort();
+        dependencies.dedup();
+        dependencies
+    }
+
+    pub fn find_cycle(&self) -> Option<Vec<NodeId>> {
+        super::algorithms::find_cycle(&self.graph).map(|cycle| {
+            cycle
+                .into_iter()
+                .map(|index| self.graph[index].id.clone())
+                .collect()
+        })
     }
 }
 
