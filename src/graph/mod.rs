@@ -1,6 +1,9 @@
-pub(crate) mod algorithms;
-pub mod builder;
-pub mod model;
+//! Desired declaration graph.
 
-pub use builder::*;
-pub use model::*;
+mod builder;
+mod desired;
+mod model;
+
+pub use builder::{DesiredGraphBuilder, GraphBuildError};
+pub use desired::{DesiredGraph, GraphCycle, GraphLookupError};
+pub use model::{Declaration, DeclarationId};

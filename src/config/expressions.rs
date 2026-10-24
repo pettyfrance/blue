@@ -4,7 +4,7 @@ use std::fmt;
 use super::model::{Expr, ExprKind, Reference, TemplatePart, Value};
 use super::source::{SourceId, SourceSpan, Spanned};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpressionError {
     UnclosedExpression,
     UnexpectedClosingBraces,

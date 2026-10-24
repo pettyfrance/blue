@@ -1,178 +1,224 @@
-use std::collections::BTreeMap;
 use std::fmt;
 
-use petgraph::Direction;
-use petgraph::algo::toposort;
-use petgraph::stable_graph::{NodeIndex, StableDiGraph};
-use petgraph::visit::EdgeRef;
+use crate::config::{
+    Attributes, Parameter, ParsedData, ParsedProviderConfig, ParsedResource, SourceSpan,
+};
 
+/// A declaration's identity, independent of provider selection or remote identity.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NodeId {
+pub enum DeclarationId {
     Provider { name: String },
     Parameter { name: String },
-    Data { data_type: String, name: String },
     Resource { resource_type: String, name: String },
+    Data { data_type: String, name: String },
 }
 
-impl fmt::Display for NodeId {
+impl fmt::Display for DeclarationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Provider { name } => write!(f, "provider.{name}"),
             Self::Parameter { name } => write!(f, "parameter.{name}"),
-            Self::Data { data_type, name } => write!(f, "data.{data_type}.{name}"),
             Self::Resource {
                 resource_type,
                 name,
             } => write!(f, "resource.{resource_type}.{name}"),
+            Self::Data { data_type, name } => write!(f, "data.{data_type}.{name}"),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GraphNode {
-    pub id: NodeId,
-    pub kind: GraphNodeKind,
+/// A borrowed parsed block. Attributes, expressions, and source spans remain in
+/// the original parsed configuration rather than being copied into a new model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Declaration<'a> {
+    Provider(&'a ParsedProviderConfig),
+    Parameter(&'a Parameter),
+    Resource(&'a ParsedResource),
+    Data(&'a ParsedData),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GraphNodeKind {
-    Provider,
-    Parameter,
-    Data { provider: String },
-    Resource { provider: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EdgeKind {
-    Provider,
-    Reference,
-}
-
-#[derive(Debug, Clone)]
-pub struct DesiredGraph {
-    graph: StableDiGraph<GraphNode, EdgeKind>,
-    node_indices: BTreeMap<NodeId, NodeIndex>,
-}
-
-impl DesiredGraph {
-    pub fn new() -> Self {
-        Self {
-            graph: StableDiGraph::new(),
-            node_indices: BTreeMap::new(),
+impl<'a> Declaration<'a> {
+    pub fn id(&self) -> DeclarationId {
+        match self {
+            Self::Provider(block) => DeclarationId::Provider {
+                name: block.name.value.clone(),
+            },
+            Self::Parameter(block) => DeclarationId::Parameter {
+                name: block.name.value.clone(),
+            },
+            Self::Resource(block) => DeclarationId::Resource {
+                resource_type: block.resource_type.value.clone(),
+                name: block.name.value.clone(),
+            },
+            Self::Data(block) => DeclarationId::Data {
+                data_type: block.data_type.value.clone(),
+                name: block.name.value.clone(),
+            },
         }
     }
 
-    pub fn add_node(&mut self, node: GraphNode) -> NodeIndex {
-        if let Some(index) = self.node_indices.get(&node.id).copied() {
-            self.graph[index] = node;
-            return index;
+    pub fn attributes(&self) -> &'a Attributes {
+        match self {
+            Self::Provider(block) => &block.attributes,
+            Self::Parameter(block) => &block.attributes,
+            Self::Resource(block) => &block.attributes,
+            Self::Data(block) => &block.attributes,
         }
-
-        let id = node.id.clone();
-        let index = self.graph.add_node(node);
-        self.node_indices.insert(id, index);
-        index
     }
 
-    pub fn add_edge(&mut self, from: &NodeId, to: &NodeId, kind: EdgeKind) -> Option<()> {
-        let from = self.node_indices.get(from).copied()?;
-        let to = self.node_indices.get(to).copied()?;
-
-        if self
-            .graph
-            .edges(from)
-            .any(|edge| edge.target() == to && edge.weight() == &kind)
-        {
-            return Some(());
+    pub fn span(&self) -> SourceSpan {
+        match self {
+            Self::Provider(block) => block.span,
+            Self::Parameter(block) => block.span,
+            Self::Resource(block) => block.span,
+            Self::Data(block) => block.span,
         }
+    }
+}
 
-        self.graph.add_edge(from, to, kind);
-        Some(())
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeSet, HashSet};
+
+    use super::*;
+    use crate::config::{ConfigReader, SourceId, Spanned, TomlReader};
+
+    #[test]
+    fn ids_format_and_distinguish_declaration_kinds_and_local_types() {
+        let cases = [
+            (
+                DeclarationId::Provider { name: "app".into() },
+                "provider.app",
+            ),
+            (
+                DeclarationId::Parameter { name: "app".into() },
+                "parameter.app",
+            ),
+            (
+                DeclarationId::Resource {
+                    resource_type: "server".into(),
+                    name: "app".into(),
+                },
+                "resource.server.app",
+            ),
+            (
+                DeclarationId::Resource {
+                    resource_type: "database".into(),
+                    name: "app".into(),
+                },
+                "resource.database.app",
+            ),
+            (
+                DeclarationId::Data {
+                    data_type: "server".into(),
+                    name: "app".into(),
+                },
+                "data.server.app",
+            ),
+        ];
+        for (id, text) in &cases {
+            assert_eq!(id.to_string(), *text);
+        }
+        let ids = cases.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids.iter().cloned().collect::<BTreeSet<_>>().len(),
+            cases.len()
+        );
+        assert_eq!(ids.into_iter().collect::<HashSet<_>>().len(), cases.len());
     }
 
-    pub fn contains_node(&self, id: &NodeId) -> bool {
-        self.node_indices.contains_key(id)
-    }
-
-    pub fn node(&self, id: &NodeId) -> Option<&GraphNode> {
-        self.node_indices
-            .get(id)
-            .and_then(|index| self.graph.node_weight(*index))
-    }
-
-    pub fn node_count(&self) -> usize {
-        self.graph.node_count()
-    }
-
-    pub fn edge_count(&self) -> usize {
-        self.graph.edge_count()
-    }
-
-    pub fn has_edge(&self, from: &NodeId, to: &NodeId, kind: &EdgeKind) -> bool {
-        self.edge_count_between(from, to, kind) > 0
-    }
-
-    pub fn edge_count_between(&self, from: &NodeId, to: &NodeId, kind: &EdgeKind) -> usize {
-        let Some(from) = self.node_indices.get(from).copied() else {
-            return 0;
+    #[test]
+    fn declarations_borrow_original_blocks_attributes_and_spans() {
+        let parsed = TomlReader
+            .read(
+                SourceId(17),
+                r#"
+[provider.cloud]
+type = "example"
+region = "eu"
+[parameter.environment]
+default = "prod"
+[resource.server.app]
+provider = "cloud"
+name = "app-{{ parameter.environment }}"
+[data.info.main]
+provider = "cloud"
+lookup = "app"
+"#,
+            )
+            .unwrap();
+        let cases = [
+            (
+                Declaration::Provider(&parsed.providers[0]),
+                "provider.cloud",
+                &parsed.providers[0].attributes,
+                parsed.providers[0].span,
+            ),
+            (
+                Declaration::Parameter(&parsed.parameters[0]),
+                "parameter.environment",
+                &parsed.parameters[0].attributes,
+                parsed.parameters[0].span,
+            ),
+            (
+                Declaration::Resource(&parsed.resources[0]),
+                "resource.server.app",
+                &parsed.resources[0].attributes,
+                parsed.resources[0].span,
+            ),
+            (
+                Declaration::Data(&parsed.data[0]),
+                "data.info.main",
+                &parsed.data[0].attributes,
+                parsed.data[0].span,
+            ),
+        ];
+        for (declaration, id, attributes, span) in cases {
+            assert_eq!(declaration.id().to_string(), id);
+            assert!(std::ptr::eq(declaration.attributes(), attributes));
+            assert_eq!(declaration.span(), span);
+            assert_eq!(declaration.span().source, SourceId(17));
+        }
+        let Declaration::Resource(block) = Declaration::Resource(&parsed.resources[0]) else {
+            unreachable!()
         };
-        let Some(to) = self.node_indices.get(to).copied() else {
-            return 0;
-        };
-
-        self.graph
-            .edges(from)
-            .filter(|edge| edge.target() == to && edge.weight() == kind)
-            .count()
+        assert!(std::ptr::eq(block, &parsed.resources[0]));
     }
 
-    pub fn graph(&self) -> &StableDiGraph<GraphNode, EdgeKind> {
-        &self.graph
+    #[test]
+    fn resource_and_data_identity_exclude_provider_selection() {
+        let parsed = TomlReader
+            .read(
+                SourceId(0),
+                r#"
+[resource.server.app]
+provider = "first"
+[data.info.main]
+provider = "first"
+"#,
+            )
+            .unwrap();
+        let mut resource = parsed.resources[0].clone();
+        let mut data = parsed.data[0].clone();
+        resource.provider = Some(Spanned::synthetic("second".into()));
+        data.provider = None;
+        assert_eq!(
+            Declaration::Resource(&resource).id(),
+            Declaration::Resource(&parsed.resources[0]).id()
+        );
+        assert_eq!(
+            Declaration::Data(&data).id(),
+            Declaration::Data(&parsed.data[0]).id()
+        );
     }
 
-    pub fn node_indices(&self) -> &BTreeMap<NodeId, NodeIndex> {
-        &self.node_indices
-    }
-
-    pub fn topological_order(&self) -> Result<Vec<NodeId>, Vec<NodeId>> {
-        match toposort(&self.graph, None) {
-            Ok(order) => Ok(order
-                .into_iter()
-                .filter_map(|index| self.graph.node_weight(index))
-                .map(|node| node.id.clone())
-                .collect()),
-            Err(_) => Err(self.find_cycle().unwrap_or_default()),
-        }
-    }
-
-    pub fn dependencies_of(&self, node: &NodeId) -> Vec<NodeId> {
-        let Some(index) = self.node_indices.get(node).copied() else {
-            return Vec::new();
-        };
-
-        let mut dependencies = self
-            .graph
-            .edges_directed(index, Direction::Incoming)
-            .filter_map(|edge| self.graph.node_weight(edge.source()))
-            .map(|node| node.id.clone())
-            .collect::<Vec<_>>();
-        dependencies.sort();
-        dependencies.dedup();
-        dependencies
-    }
-
-    pub fn find_cycle(&self) -> Option<Vec<NodeId>> {
-        super::algorithms::find_cycle(&self.graph).map(|cycle| {
-            cycle
-                .into_iter()
-                .map(|index| self.graph[index].id.clone())
-                .collect()
-        })
-    }
-}
-
-impl Default for DesiredGraph {
-    fn default() -> Self {
-        Self::new()
+    #[test]
+    fn attribute_borrow_outlives_temporary_declaration_wrapper() {
+        let parsed = TomlReader
+            .read(SourceId(0), "[parameter.environment]\ndefault = \"prod\"\n")
+            .unwrap();
+        let attributes = Declaration::Parameter(&parsed.parameters[0]).attributes();
+        assert!(std::ptr::eq(attributes, &parsed.parameters[0].attributes));
+        assert!(attributes.contains_key("default"));
     }
 }

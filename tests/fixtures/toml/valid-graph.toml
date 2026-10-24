@@ -1,0 +1,9 @@
+[provider.cloud]
+type = "ovh"
+
+[parameter.environment]
+default = "prod"
+
+[resource.instance.app]
+provider = "cloud"
+name = "app-{{ parameter.environment }}"

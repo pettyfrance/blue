@@ -1,0 +1,6 @@
+[provider.alpha]
+type = "ovh"
+default = true
+[provider.beta]
+type = "ovh"
+default = true

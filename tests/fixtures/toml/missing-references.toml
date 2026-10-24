@@ -1,0 +1,2 @@
+[parameter.result]
+default = ["{{ parameter.alpha }}", "{{ parameter.beta }}"]

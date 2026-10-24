@@ -1,19 +1,11 @@
-pub mod capability;
-pub mod identity;
-pub mod loader;
-pub mod operation;
-pub mod registry;
-pub mod request;
-pub mod schema;
-pub mod state;
-pub mod value;
+//! Provider contracts and schema definitions.
 
-pub use capability::*;
-pub use identity::*;
-pub use loader::*;
-pub use operation::*;
-pub use registry::*;
-pub use request::*;
-pub use schema::*;
-pub use state::*;
-pub use value::*;
+mod loader;
+mod registry;
+mod schema;
+mod traits;
+
+pub use loader::{BuiltinProviderLoader, ProviderLoadError};
+pub use registry::{ProviderRegistrationError, ProviderRegistry};
+pub use schema::{FieldSchema, Schema, ValueType};
+pub use traits::{Provider, ResourceType};

@@ -1,0 +1,4 @@
+[parameter.a]
+default = "{{ parameter.b }}"
+[parameter.b]
+default = "{{ parameter.a }}"

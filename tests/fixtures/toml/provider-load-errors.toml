@@ -1,0 +1,5 @@
+[provider.alpha]
+type = "unknown"
+[provider.beta]
+type = "ovh"
+source = "https://user:fake-secret@example.com/provider.git"

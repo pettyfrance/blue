@@ -30,6 +30,18 @@ pub struct Spanned<T> {
     pub span: SourceSpan,
 }
 
+impl Source {
+    /// Translate a UTF-8 byte offset into a 1-based line and column.
+    /// Columns count Unicode scalar values, not bytes or terminal display cells.
+    /// EOF is valid; out-of-bounds offsets and partial UTF-8 characters are not.
+    pub fn line_column(&self, byte_offset: usize) -> Option<(usize, usize)> {
+        let prefix = self.text.get(..byte_offset)?;
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        Some((line, column))
+    }
+}
+
 impl SourceId {
     pub const SYNTHETIC: SourceId = SourceId(usize::MAX);
 }
@@ -98,6 +110,36 @@ impl<T> Spanned<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_locations_handle_lines_unicode_and_eof() {
+        let source = Source {
+            name: "test".into(),
+            text: "é界\nnext\r\n".into(),
+        };
+        assert_eq!(source.line_column(0), Some((1, 1)));
+        assert_eq!(source.line_column("é".len()), Some((1, 2)));
+        assert_eq!(source.line_column("é界".len()), Some((1, 3)));
+        assert_eq!(source.line_column("é界\n".len()), Some((2, 1)));
+        assert_eq!(source.line_column("é界\nnext".len()), Some((2, 5)));
+        assert_eq!(source.line_column(source.text.len()), Some((3, 1)));
+        assert_eq!(source.line_column(1), None);
+        assert_eq!(source.line_column(3), None);
+        assert_eq!(source.line_column(source.text.len() + 1), None);
+        assert_eq!(source.line_column(usize::MAX), None);
+    }
+
+    #[test]
+    fn source_locations_handle_empty_input_and_no_trailing_newline() {
+        let mut source = Source {
+            name: "test".into(),
+            text: String::new(),
+        };
+        assert_eq!(source.line_column(0), Some((1, 1)));
+        assert_eq!(source.line_column(1), None);
+        source.text = "one\ntwo".into();
+        assert_eq!(source.line_column(source.text.len()), Some((2, 4)));
+    }
 
     #[test]
     fn adding_source_returns_first_source_id() {

@@ -13,8 +13,19 @@ use super::source::{SourceId, SourceSpan, Spanned};
 
 pub struct TomlReader;
 
-#[derive(Debug)]
-pub enum TomlReaderError {
+#[cfg(test)]
+#[path = "toml_error_tests.rs"]
+mod error_tests;
+
+/// A parser failure with an optional location in the original source text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TomlReaderError {
+    pub kind: TomlReaderErrorKind,
+    pub span: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TomlReaderErrorKind {
     Syntax(String),
     Expression(ExpressionError),
     InvalidSection { section: String, message: String },
@@ -25,7 +36,7 @@ pub enum TomlReaderError {
     MissingSpan(String),
 }
 
-impl fmt::Display for TomlReaderError {
+impl fmt::Display for TomlReaderErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Syntax(err) => write!(f, "failed to parse TOML syntax: {err}"),
@@ -44,11 +55,48 @@ impl fmt::Display for TomlReaderError {
     }
 }
 
-impl Error for TomlReaderError {}
+impl TomlReaderErrorKind {
+    fn at(self, span: SourceSpan) -> TomlReaderError {
+        TomlReaderError {
+            kind: self,
+            span: Some(span),
+        }
+    }
+}
 
-impl From<ExpressionError> for TomlReaderError {
-    fn from(value: ExpressionError) -> Self {
-        Self::Expression(value)
+impl fmt::Display for TomlReaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(f)
+    }
+}
+
+impl Error for TomlReaderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.kind)
+    }
+}
+
+impl Error for TomlReaderErrorKind {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Expression(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+fn syntax_error(
+    source_id: SourceId,
+    error: &toml_parser::ParseError,
+    fallback: Option<SourceSpan>,
+) -> TomlReaderError {
+    TomlReaderError {
+        kind: TomlReaderErrorKind::Syntax(error.description().to_owned()),
+        span: error
+            .unexpected()
+            .or_else(|| error.context())
+            .map(|span| parser_span_to_source_span(source_id, span))
+            .or(fallback),
     }
 }
 
@@ -141,7 +189,7 @@ fn parse_toml_syntax(source_id: SourceId, input: &str) -> Result<TomlDocument, T
     toml_parser::parser::parse_document(&tokens, &mut events, &mut errors);
 
     if let Some(error) = errors.first() {
-        return Err(TomlReaderError::Syntax(error.description().to_owned()));
+        return Err(syntax_error(source_id, error, None));
     }
 
     TomlEventParser {
@@ -181,9 +229,10 @@ impl TomlEventParser<'_> {
                     self.entries.push(TomlEntry::Table { path, span });
                 }
                 EventKind::ArrayTableOpen => {
-                    return Err(TomlReaderError::UnsupportedValue(
+                    return Err(TomlReaderErrorKind::UnsupportedValue(
                         "arrays of tables are not supported".into(),
-                    ));
+                    )
+                    .at(parser_span_to_source_span(self.source_id, event.span())));
                 }
                 EventKind::SimpleKey => {
                     let (key_path, value, span) = self.parse_key_value()?;
@@ -195,7 +244,8 @@ impl TomlEventParser<'_> {
                     });
                 }
                 EventKind::Error => {
-                    return Err(TomlReaderError::Syntax("invalid TOML syntax".into()));
+                    return Err(TomlReaderErrorKind::Syntax("invalid TOML syntax".into())
+                        .at(parser_span_to_source_span(self.source_id, event.span())));
                 }
                 _ => {
                     self.position += 1;
@@ -230,7 +280,9 @@ impl TomlEventParser<'_> {
         let start = key_path
             .first()
             .map(|key| key.span.span.start)
-            .ok_or_else(|| TomlReaderError::Syntax("missing key".into()))?;
+            .ok_or_else(|| {
+                TomlReaderErrorKind::Syntax("missing key".into()).at(self.current_span())
+            })?;
         self.expect(EventKind::KeyValSep)?;
         let value = self.parse_value()?;
         let span = SourceSpan::new(self.source_id, start, value.span().span.end);
@@ -245,7 +297,10 @@ impl TomlEventParser<'_> {
         let start = key_path
             .first()
             .map(|key| key.span.span.start)
-            .ok_or_else(|| TomlReaderError::Syntax("missing inline table key".into()))?;
+            .ok_or_else(|| {
+                TomlReaderErrorKind::Syntax("missing inline table key".into())
+                    .at(self.current_span())
+            })?;
         self.expect(EventKind::KeyValSep)?;
         let value = self.parse_value()?;
         let span = SourceSpan::new(self.source_id, start, value.span().span.end);
@@ -268,7 +323,7 @@ impl TomlEventParser<'_> {
         loop {
             self.skip_inline_trivia();
             let Some(event) = self.peek() else {
-                return Err(TomlReaderError::UnexpectedEof);
+                return Err(self.eof_error());
             };
 
             if terminators.contains(&event.kind()) {
@@ -280,7 +335,7 @@ impl TomlEventParser<'_> {
             self.skip_inline_trivia();
 
             let Some(next) = self.peek() else {
-                return Err(TomlReaderError::UnexpectedEof);
+                return Err(self.eof_error());
             };
 
             if next.kind() == EventKind::KeySep {
@@ -292,10 +347,11 @@ impl TomlEventParser<'_> {
                 break;
             }
 
-            return Err(TomlReaderError::UnexpectedEvent(format!(
+            return Err(TomlReaderErrorKind::UnexpectedEvent(format!(
                 "expected key separator or terminator, found {}",
                 next.kind().description()
-            )));
+            ))
+            .at(parser_span_to_source_span(self.source_id, next.span())));
         }
 
         Ok(path)
@@ -307,21 +363,25 @@ impl TomlEventParser<'_> {
 
         self.skip_trivia();
         let Some(event) = self.peek().cloned() else {
-            return Err(TomlReaderError::UnexpectedEof);
+            return Err(self.eof_error());
         };
 
         match event.kind() {
             EventKind::Scalar => {
                 self.position += 1;
-                let raw = self
-                    .source
-                    .get(&event)
-                    .ok_or_else(|| TomlReaderError::MissingSpan("scalar".into()))?;
+                let raw = self.source.get(&event).ok_or_else(|| {
+                    TomlReaderErrorKind::MissingSpan("scalar".into())
+                        .at(parser_span_to_source_span(self.source_id, event.span()))
+                })?;
                 let mut decoded = String::new();
                 let mut errors = Vec::new();
                 let kind = raw.decode_scalar(&mut decoded, &mut errors);
                 if let Some(error) = errors.first() {
-                    return Err(TomlReaderError::Syntax(error.description().to_owned()));
+                    return Err(syntax_error(
+                        self.source_id,
+                        error,
+                        Some(parser_span_to_source_span(self.source_id, event.span())),
+                    ));
                 }
 
                 let span = parser_span_to_source_span(self.source_id, event.span());
@@ -335,15 +395,13 @@ impl TomlEventParser<'_> {
                     }),
                     ScalarKind::Boolean(value) => Ok(TomlValue::Bool(Spanned::new(value, span))),
                     ScalarKind::Integer(_) => {
-                        let value = parse_integer(raw.as_str())?;
+                        let value = parse_integer(raw.as_str(), span)?;
                         Ok(TomlValue::Integer(Spanned::new(value, span)))
                     }
                     ScalarKind::Float => {
-                        let value = raw
-                            .as_str()
-                            .replace('_', "")
-                            .parse::<f64>()
-                            .map_err(|_| TomlReaderError::Syntax("invalid float".into()))?;
+                        let value = raw.as_str().replace('_', "").parse::<f64>().map_err(|_| {
+                            TomlReaderErrorKind::Syntax("invalid float".into()).at(span)
+                        })?;
                         Ok(TomlValue::Float(Spanned::new(value, span)))
                     }
                     ScalarKind::DateTime => Ok(TomlValue::Datetime(span)),
@@ -351,10 +409,11 @@ impl TomlEventParser<'_> {
             }
             EventKind::ArrayOpen => self.parse_array(),
             EventKind::InlineTableOpen => self.parse_inline_table(),
-            other => Err(TomlReaderError::UnexpectedEvent(format!(
+            other => Err(TomlReaderErrorKind::UnexpectedEvent(format!(
                 "expected value, found {}",
                 other.description()
-            ))),
+            ))
+            .at(parser_span_to_source_span(self.source_id, event.span()))),
         }
     }
 
@@ -367,7 +426,7 @@ impl TomlEventParser<'_> {
         loop {
             self.skip_trivia();
             let Some(event) = self.peek() else {
-                return Err(TomlReaderError::UnexpectedEof);
+                return Err(self.eof_error());
             };
 
             if event.kind() == EventKind::ArrayClose {
@@ -397,7 +456,7 @@ impl TomlEventParser<'_> {
         loop {
             self.skip_trivia();
             let Some(event) = self.peek() else {
-                return Err(TomlReaderError::UnexpectedEof);
+                return Err(self.eof_error());
             };
 
             if event.kind() == EventKind::InlineTableClose {
@@ -422,15 +481,19 @@ impl TomlEventParser<'_> {
         &self,
         event: &toml_parser::parser::Event,
     ) -> Result<Spanned<String>, TomlReaderError> {
-        let raw = self
-            .source
-            .get(event)
-            .ok_or_else(|| TomlReaderError::MissingSpan("key".into()))?;
+        let raw = self.source.get(event).ok_or_else(|| {
+            TomlReaderErrorKind::MissingSpan("key".into())
+                .at(parser_span_to_source_span(self.source_id, event.span()))
+        })?;
         let mut decoded = String::new();
         let mut errors = Vec::new();
         raw.decode_key(&mut decoded, &mut errors);
         if let Some(error) = errors.first() {
-            return Err(TomlReaderError::Syntax(error.description().to_owned()));
+            return Err(syntax_error(
+                self.source_id,
+                error,
+                Some(parser_span_to_source_span(self.source_id, event.span())),
+            ));
         }
 
         Ok(Spanned::new(
@@ -464,15 +527,16 @@ impl TomlEventParser<'_> {
         kind: toml_parser::parser::EventKind,
     ) -> Result<toml_parser::parser::Event, TomlReaderError> {
         let Some(event) = self.peek().cloned() else {
-            return Err(TomlReaderError::UnexpectedEof);
+            return Err(self.eof_error());
         };
 
         if event.kind() != kind {
-            return Err(TomlReaderError::UnexpectedEvent(format!(
+            return Err(TomlReaderErrorKind::UnexpectedEvent(format!(
                 "expected {}, found {}",
                 kind.description(),
                 event.kind().description()
-            )));
+            ))
+            .at(parser_span_to_source_span(self.source_id, event.span())));
         }
 
         self.position += 1;
@@ -482,9 +546,26 @@ impl TomlEventParser<'_> {
     fn peek(&self) -> Option<&toml_parser::parser::Event> {
         self.events.get(self.position)
     }
+
+    fn current_span(&self) -> SourceSpan {
+        self.peek()
+            .map(|event| parser_span_to_source_span(self.source_id, event.span()))
+            .unwrap_or_else(|| {
+                SourceSpan::new(
+                    self.source_id,
+                    self.source.input().len(),
+                    self.source.input().len(),
+                )
+            })
+    }
+
+    fn eof_error(&self) -> TomlReaderError {
+        let end = self.source.input().len();
+        TomlReaderErrorKind::UnexpectedEof.at(SourceSpan::new(self.source_id, end, end))
+    }
 }
 
-fn parse_integer(raw: &str) -> Result<i64, TomlReaderError> {
+fn parse_integer(raw: &str, span: SourceSpan) -> Result<i64, TomlReaderError> {
     let mut value = raw.replace('_', "");
     let sign = if let Some(stripped) = value.strip_prefix('-') {
         value = stripped.to_string();
@@ -507,7 +588,7 @@ fn parse_integer(raw: &str) -> Result<i64, TomlReaderError> {
     };
 
     let parsed = i64::from_str_radix(digits, radix)
-        .map_err(|_| TomlReaderError::Syntax("invalid integer".into()))?;
+        .map_err(|_| TomlReaderErrorKind::Syntax("invalid integer".into()).at(span))?;
     Ok(parsed * sign)
 }
 
@@ -607,7 +688,11 @@ fn apply_table_entry(
             let data = ensure_data(data, &path[1], &path[2], span);
             insert_object_path(&mut data.attributes, &path[3..], span);
         }
-        Some(other) => return Err(TomlReaderError::UnknownTopLevelSection(other.to_owned())),
+        Some(other) => {
+            return Err(
+                TomlReaderErrorKind::UnknownTopLevelSection(other.to_owned()).at(path[0].span),
+            );
+        }
         None => {}
     }
 
@@ -743,13 +828,19 @@ fn apply_key_value_entry(
                 insert_attribute_path(&mut data.attributes, &attribute_path, attribute);
             }
         }
-        Some(other) => return Err(TomlReaderError::UnknownTopLevelSection(other.to_owned())),
+        Some(other) => {
+            return Err(
+                TomlReaderErrorKind::UnknownTopLevelSection(other.to_owned())
+                    .at(table_path[0].span),
+            );
+        }
         None => {
-            return Err(TomlReaderError::InvalidSection {
+            return Err(TomlReaderErrorKind::InvalidSection {
                 section: "root".into(),
                 message: "key/value pairs must be inside provider/parameter/resource/data sections"
                     .into(),
-            });
+            }
+            .at(span));
         }
     }
 
@@ -776,12 +867,13 @@ fn ensure_provider<'a>(
 fn finalize_provider(
     provider: PendingProviderConfig,
 ) -> Result<ParsedProviderConfig, TomlReaderError> {
-    let provider_type = provider
-        .provider_type
-        .ok_or_else(|| TomlReaderError::InvalidSection {
+    let provider_type = provider.provider_type.ok_or_else(|| {
+        TomlReaderErrorKind::InvalidSection {
             section: format!("provider.{}", provider.name.value),
             message: "missing required `type` attribute".into(),
-        })?;
+        }
+        .at(provider.span)
+    })?;
 
     Ok(ParsedProviderConfig {
         name: provider.name,
@@ -910,14 +1002,16 @@ fn toml_value_to_static_string(
     value: TomlValue,
     description: &str,
 ) -> Result<Spanned<String>, TomlReaderError> {
+    let value_span = value.span();
     let expr = toml_value_to_expr(source_id, input, value)?;
 
     match expr.value {
         ExprKind::Literal(Value::String(value)) => Ok(Spanned::new(value, expr.span)),
-        _ => Err(TomlReaderError::InvalidSection {
+        _ => Err(TomlReaderErrorKind::InvalidSection {
             section: "provider".into(),
             message: format!("{description} must be a literal string"),
-        }),
+        }
+        .at(value_span)),
     }
 }
 
@@ -927,14 +1021,11 @@ fn toml_value_to_static_bool(
 ) -> Result<Spanned<bool>, TomlReaderError> {
     match value {
         TomlValue::Bool(value) => Ok(value),
-        other => Err(TomlReaderError::InvalidSection {
+        other => Err(TomlReaderErrorKind::InvalidSection {
             section: "provider".into(),
-            message: format!(
-                "{description} must be a literal bool at {}..{}",
-                other.span().span.start,
-                other.span().span.end
-            ),
-        }),
+            message: format!("{description} must be a literal bool"),
+        }
+        .at(other.span())),
     }
 }
 
@@ -946,11 +1037,12 @@ fn toml_value_to_expr(
     match value {
         TomlValue::String {
             value,
-            span: _,
+            span,
             raw_span,
         } => {
             let mapper = TomlStringSpanMapper::new(source_id, &value, input, raw_span)?;
-            Ok(expressions::parse_string(&value, &mapper)?)
+            expressions::parse_string(&value, &mapper)
+                .map_err(|error| TomlReaderErrorKind::Expression(error).at(span))
         }
         TomlValue::Integer(value) => Ok(Spanned::new(
             ExprKind::Literal(Value::Integer(value.value)),
@@ -991,10 +1083,9 @@ fn toml_value_to_expr(
                 span,
             ))
         }
-        TomlValue::Datetime(span) => Err(TomlReaderError::UnsupportedValue(format!(
-            "datetime at {}..{}",
-            span.span.start, span.span.end
-        ))),
+        TomlValue::Datetime(span) => {
+            Err(TomlReaderErrorKind::UnsupportedValue("datetime".into()).at(span))
+        }
     }
 }
 
@@ -1015,13 +1106,21 @@ fn table_path_span(path: &[Spanned<String>]) -> SourceSpan {
 }
 
 fn invalid_section(path: &[Spanned<String>], message: &str) -> TomlReaderError {
-    TomlReaderError::InvalidSection {
-        section: path
-            .iter()
-            .map(|segment| segment.value.as_str())
-            .collect::<Vec<_>>()
-            .join("."),
-        message: message.to_owned(),
+    let span = if path.is_empty() {
+        None
+    } else {
+        Some(table_path_span(path))
+    };
+    TomlReaderError {
+        kind: TomlReaderErrorKind::InvalidSection {
+            section: path
+                .iter()
+                .map(|segment| segment.value.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+            message: message.to_owned(),
+        },
+        span,
     }
 }
 
@@ -1037,9 +1136,10 @@ impl TomlStringSpanMapper {
         input: &str,
         raw_span: Range<usize>,
     ) -> Result<Self, TomlReaderError> {
-        let raw = input
-            .get(raw_span.clone())
-            .ok_or_else(|| TomlReaderError::MissingSpan("string source text".into()))?;
+        let raw = input.get(raw_span.clone()).ok_or_else(|| TomlReaderError {
+            kind: TomlReaderErrorKind::MissingSpan("string source text".into()),
+            span: None,
+        })?;
         let boundaries = build_toml_string_boundaries(decoded, raw, raw_span.start)
             .unwrap_or_else(|| simple_string_boundaries(decoded, raw, raw_span.start));
 

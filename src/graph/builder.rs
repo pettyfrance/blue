@@ -1,199 +1,365 @@
+use std::collections::BTreeMap;
+use std::error::Error;
 use std::fmt;
 
-use super::model::{DesiredGraph, EdgeKind, GraphNode, GraphNodeKind, NodeId};
-use crate::config::{Attributes, Config, Reference, SourceSpan};
+use crate::config::{ParsedConfig, Reference, SourceSpan};
 
+use super::desired::{ConstructionError, DesiredGraph};
+use super::model::{Declaration, DeclarationId};
+
+/// Build a validated desired graph directly from borrowed parsed declarations.
 pub struct DesiredGraphBuilder;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphBuildError {
-    MalformedReference { path: Vec<String>, span: SourceSpan },
-    UnknownReference { path: Vec<String>, span: SourceSpan },
-    Cycle { path: Vec<NodeId> },
+    DuplicateDeclaration {
+        id: DeclarationId,
+        first_span: SourceSpan,
+        duplicate_span: SourceSpan,
+    },
+    UnknownProvider {
+        declaration: DeclarationId,
+        provider: String,
+        span: SourceSpan,
+    },
+    MissingProvider {
+        declaration: DeclarationId,
+        span: SourceSpan,
+    },
+    AmbiguousProvider {
+        declaration: DeclarationId,
+        candidates: Vec<DeclarationId>,
+        span: SourceSpan,
+    },
+    MultipleDefaultProviders {
+        providers: Vec<(DeclarationId, SourceSpan)>,
+    },
+    Cycle {
+        /// The first declaration is repeated at the end to close the cycle.
+        path: Vec<DeclarationId>,
+    },
+    MalformedReference {
+        path: Vec<String>,
+        span: SourceSpan,
+    },
+    UnknownReference {
+        target: DeclarationId,
+        path: Vec<String>,
+        span: SourceSpan,
+    },
 }
 
 impl fmt::Display for GraphBuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MalformedReference { path, .. } => {
-                write!(f, "malformed reference `{}`", format_reference_path(path))
-            }
-            Self::UnknownReference { path, .. } => {
-                write!(f, "unknown reference `{}`", format_reference_path(path))
-            }
-            Self::Cycle { path } => write!(
+            Self::DuplicateDeclaration { id, .. } => write!(f, "duplicate declaration `{id}`"),
+            Self::UnknownProvider {
+                declaration,
+                provider,
+                ..
+            } => write!(
                 f,
-                "dependency cycle detected: {}",
-                path.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" -> ")
+                "unknown provider `{provider}` selected by `{declaration}`"
             ),
+            Self::MissingProvider { declaration, .. } => {
+                write!(f, "no provider is configured for `{declaration}`")
+            }
+            Self::AmbiguousProvider {
+                declaration,
+                candidates,
+                ..
+            } => {
+                write!(
+                    f,
+                    "provider selection is ambiguous for `{declaration}`; select a provider explicitly or mark one default; candidates: "
+                )?;
+                for (index, candidate) in candidates.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{candidate}")?;
+                }
+                Ok(())
+            }
+            Self::MalformedReference { path, .. } => {
+                write!(f, "malformed reference `{}`", format_reference(path))
+            }
+            Self::UnknownReference { target, path, .. } => write!(
+                f,
+                "reference `{}` targets undeclared `{target}`",
+                format_reference(path)
+            ),
+            Self::Cycle { path } => {
+                f.write_str("dependency cycle: ")?;
+                for (index, id) in path.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(" → ")?;
+                    }
+                    write!(f, "{id}")?;
+                }
+                Ok(())
+            }
+            Self::MultipleDefaultProviders { providers } => {
+                f.write_str("multiple providers are marked default: ")?;
+                for (index, (provider, _)) in providers.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{provider}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
-impl std::error::Error for GraphBuildError {}
+impl GraphBuildError {
+    /// Primary diagnostic location. Related spans remain in the error fields;
+    /// cycles have no single source location and retain their full path instead.
+    pub fn primary_span(&self) -> Option<SourceSpan> {
+        match self {
+            Self::DuplicateDeclaration { duplicate_span, .. } => Some(*duplicate_span),
+            Self::UnknownProvider { span, .. }
+            | Self::MissingProvider { span, .. }
+            | Self::AmbiguousProvider { span, .. }
+            | Self::MalformedReference { span, .. }
+            | Self::UnknownReference { span, .. } => Some(*span),
+            Self::MultipleDefaultProviders { providers } => {
+                providers.first().map(|(_, span)| *span)
+            }
+            Self::Cycle { .. } => None,
+        }
+    }
+}
+
+impl Error for GraphBuildError {}
 
 impl DesiredGraphBuilder {
-    pub fn build(config: &Config) -> Result<DesiredGraph, Vec<GraphBuildError>> {
+    /// Return a complete graph, or errors from the first failing validation pass.
+    /// No partial graph is exposed on failure.
+    pub fn build(config: &ParsedConfig) -> Result<DesiredGraph<'_>, Vec<GraphBuildError>> {
         let mut graph = DesiredGraph::new();
-        let mut errors = Vec::new();
-
-        for provider in &config.providers {
-            let id = NodeId::Provider {
-                name: provider.name.value.clone(),
-            };
-            graph.add_node(GraphNode {
-                id,
-                kind: GraphNodeKind::Provider,
-            });
-        }
-
-        for parameter in &config.parameters {
-            let id = NodeId::Parameter {
-                name: parameter.name.value.clone(),
-            };
-            graph.add_node(GraphNode {
-                id,
-                kind: GraphNodeKind::Parameter,
-            });
-        }
-
-        for data in &config.data {
-            let id = NodeId::Data {
-                data_type: data.data_type.value.clone(),
-                name: data.name.value.clone(),
-            };
-            graph.add_node(GraphNode {
-                id: id.clone(),
-                kind: GraphNodeKind::Data {
-                    provider: data.provider.value.clone(),
-                },
-            });
-            graph.add_edge(
-                &NodeId::Provider {
-                    name: data.provider.value.clone(),
-                },
-                &id,
-                EdgeKind::Provider,
-            );
-        }
-
-        for resource in &config.resources {
-            let id = NodeId::Resource {
-                resource_type: resource.resource_type.value.clone(),
-                name: resource.name.value.clone(),
-            };
-            graph.add_node(GraphNode {
-                id: id.clone(),
-                kind: GraphNodeKind::Resource {
-                    provider: resource.provider.value.clone(),
-                },
-            });
-            graph.add_edge(
-                &NodeId::Provider {
-                    name: resource.provider.value.clone(),
-                },
-                &id,
-                EdgeKind::Provider,
-            );
-        }
-
-        for provider in &config.providers {
-            let owner = NodeId::Provider {
-                name: provider.name.value.clone(),
-            };
-            add_reference_edges(&mut graph, &owner, &provider.attributes, &mut errors);
-        }
-
-        for parameter in &config.parameters {
-            let owner = NodeId::Parameter {
-                name: parameter.name.value.clone(),
-            };
-            add_reference_edges(&mut graph, &owner, &parameter.attributes, &mut errors);
-        }
-
-        for data in &config.data {
-            let owner = NodeId::Data {
-                data_type: data.data_type.value.clone(),
-                name: data.name.value.clone(),
-            };
-            add_reference_edges(&mut graph, &owner, &data.attributes, &mut errors);
-        }
-
-        for resource in &config.resources {
-            let owner = NodeId::Resource {
-                resource_type: resource.resource_type.value.clone(),
-                name: resource.name.value.clone(),
-            };
-            add_reference_edges(&mut graph, &owner, &resource.attributes, &mut errors);
-        }
-
-        if let Some(path) = graph.find_cycle() {
-            errors.push(GraphBuildError::Cycle { path });
-        }
-
-        if errors.is_empty() {
-            Ok(graph)
-        } else {
-            Err(errors)
-        }
+        register_declarations(config, &mut graph)?;
+        resolve_providers(config, &mut graph)?;
+        add_reference_dependencies(config, &mut graph)?;
+        check_cycles(&graph).map_err(|error| vec![error])?;
+        Ok(graph)
     }
 }
 
-fn add_reference_edges(
-    graph: &mut DesiredGraph,
-    owner: &NodeId,
-    attributes: &Attributes,
-    errors: &mut Vec<GraphBuildError>,
-) {
-    for attribute in attributes.values() {
-        for reference in attribute.value.references() {
-            let target = match reference_to_node_id(reference) {
-                Ok(target) => target,
-                Err(error) => {
-                    errors.push(error);
-                    continue;
-                }
-            };
-
-            if graph.contains_node(&target) {
-                graph.add_edge(&target, owner, EdgeKind::Reference);
-            } else {
-                errors.push(GraphBuildError::UnknownReference {
-                    path: reference_path(reference),
-                    span: reference_span(reference),
+fn register_declarations<'a>(
+    config: &'a ParsedConfig,
+    graph: &mut DesiredGraph<'a>,
+) -> Result<(), Vec<GraphBuildError>> {
+    let mut errors = Vec::new();
+    for declaration in declarations(config) {
+        match graph.add_declaration(declaration) {
+            Ok(()) => {}
+            Err(ConstructionError::DuplicateDeclaration { id }) => {
+                let first = graph
+                    .declaration(&id)
+                    .expect("duplicate declaration is registered");
+                errors.push(GraphBuildError::DuplicateDeclaration {
+                    id,
+                    first_span: first.span(),
+                    duplicate_span: declaration.span(),
                 });
+            }
+            Err(_) => {
+                unreachable!("registering a declaration can only fail for a duplicate identity")
             }
         }
     }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
-fn reference_to_node_id(reference: &Reference) -> Result<NodeId, GraphBuildError> {
-    let path = reference_path(reference);
-    let span = reference_span(reference);
+fn declarations(config: &ParsedConfig) -> impl Iterator<Item = Declaration<'_>> {
+    config
+        .providers
+        .iter()
+        .map(Declaration::Provider)
+        .chain(config.parameters.iter().map(Declaration::Parameter))
+        .chain(config.resources.iter().map(Declaration::Resource))
+        .chain(config.data.iter().map(Declaration::Data))
+}
 
+fn resolve_providers(
+    config: &ParsedConfig,
+    graph: &mut DesiredGraph<'_>,
+) -> Result<(), Vec<GraphBuildError>> {
+    let providers = config
+        .providers
+        .iter()
+        .map(|provider| (provider.name.value.as_str(), provider))
+        .collect::<BTreeMap<_, _>>();
+    let defaults = providers
+        .values()
+        .copied()
+        .filter(|provider| {
+            provider
+                .default
+                .as_ref()
+                .is_some_and(|default| default.value)
+        })
+        .collect::<Vec<_>>();
+    if defaults.len() > 1 {
+        return Err(vec![GraphBuildError::MultipleDefaultProviders {
+            providers: defaults
+                .iter()
+                .map(|provider| {
+                    (
+                        Declaration::Provider(provider).id(),
+                        provider
+                            .default
+                            .as_ref()
+                            .expect("default metadata is present")
+                            .span,
+                    )
+                })
+                .collect(),
+        }]);
+    }
+
+    let mut errors = Vec::new();
+    let declarations = config
+        .resources
+        .iter()
+        .map(|resource| (Declaration::Resource(resource), resource.provider.as_ref()))
+        .chain(
+            config
+                .data
+                .iter()
+                .map(|data| (Declaration::Data(data), data.provider.as_ref())),
+        );
+    for (declaration, explicit) in declarations {
+        let id = declaration.id();
+        let selected = if let Some(explicit) = explicit {
+            match providers.get(explicit.value.as_str()) {
+                Some(provider) => *provider,
+                None => {
+                    errors.push(GraphBuildError::UnknownProvider {
+                        declaration: id,
+                        provider: explicit.value.clone(),
+                        span: explicit.span,
+                    });
+                    continue;
+                }
+            }
+        } else if providers.len() == 1 {
+            *providers.values().next().expect("one provider exists")
+        } else if let Some(default) = defaults.first() {
+            *default
+        } else {
+            errors.push(if providers.is_empty() {
+                GraphBuildError::MissingProvider {
+                    declaration: id,
+                    span: declaration.span(),
+                }
+            } else {
+                GraphBuildError::AmbiguousProvider {
+                    declaration: id,
+                    candidates: providers
+                        .values()
+                        .map(|provider| Declaration::Provider(provider).id())
+                        .collect(),
+                    span: declaration.span(),
+                }
+            });
+            continue;
+        };
+        graph
+            .set_provider(&id, &Declaration::Provider(selected).id())
+            .expect("registered resource/data and provider permit a single association");
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn add_reference_dependencies(
+    config: &ParsedConfig,
+    graph: &mut DesiredGraph<'_>,
+) -> Result<(), Vec<GraphBuildError>> {
+    let mut errors = Vec::new();
+    for declaration in declarations(config) {
+        let owner = declaration.id();
+        for attribute in declaration.attributes().values() {
+            for reference in attribute.value.references() {
+                let path = reference
+                    .path
+                    .iter()
+                    .map(|part| part.value.clone())
+                    .collect::<Vec<_>>();
+                let span = reference_span(reference, attribute.value.span);
+                let Some(target) = reference_target(&path) else {
+                    errors.push(GraphBuildError::MalformedReference { path, span });
+                    continue;
+                };
+                if graph.declaration(&target).is_err() {
+                    errors.push(GraphBuildError::UnknownReference { target, path, span });
+                    continue;
+                }
+                graph
+                    .add_dependency(&target, &owner)
+                    .expect("reference target and owner are registered");
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+// Interpret declaration identity only; suffix fields are evaluated later.
+fn reference_target(path: &[String]) -> Option<DeclarationId> {
+    if path.iter().any(String::is_empty) {
+        return None;
+    }
     match path.first().map(String::as_str) {
-        Some("parameter") if path.len() >= 2 => Ok(NodeId::Parameter {
+        Some("provider") if path.len() >= 2 => Some(DeclarationId::Provider {
             name: path[1].clone(),
         }),
-        Some("provider") if path.len() >= 2 => Ok(NodeId::Provider {
+        Some("parameter") if path.len() >= 2 => Some(DeclarationId::Parameter {
             name: path[1].clone(),
         }),
-        Some("data") if path.len() >= 3 => Ok(NodeId::Data {
-            data_type: path[1].clone(),
-            name: path[2].clone(),
-        }),
-        Some("resource") if path.len() >= 3 => Ok(NodeId::Resource {
+        Some("resource") if path.len() >= 3 => Some(DeclarationId::Resource {
             resource_type: path[1].clone(),
             name: path[2].clone(),
         }),
-        _ => Err(GraphBuildError::MalformedReference { path, span }),
+        Some("data") if path.len() >= 3 => Some(DeclarationId::Data {
+            data_type: path[1].clone(),
+            name: path[2].clone(),
+        }),
+        _ => None,
     }
 }
 
-fn format_reference_path(path: &[String]) -> String {
+fn check_cycles(graph: &DesiredGraph<'_>) -> Result<(), GraphBuildError> {
+    graph
+        .topological_order()
+        .map(|_| ())
+        .map_err(|cycle| GraphBuildError::Cycle { path: cycle.path })
+}
+
+fn reference_span(reference: &Reference, fallback: SourceSpan) -> SourceSpan {
+    match (reference.path.first(), reference.path.last()) {
+        (Some(first), Some(last)) => {
+            SourceSpan::new(first.span.source, first.span.span.start, last.span.span.end)
+        }
+        _ => fallback,
+    }
+}
+
+fn format_reference(path: &[String]) -> String {
     if path.is_empty() {
         "<empty>".into()
     } else {
@@ -201,559 +367,189 @@ fn format_reference_path(path: &[String]) -> String {
     }
 }
 
-fn reference_path(reference: &Reference) -> Vec<String> {
-    reference
-        .path
-        .iter()
-        .map(|segment| segment.value.clone())
-        .collect()
-}
+#[cfg(test)]
+#[path = "cycle_validation_tests.rs"]
+mod cycle_validation_tests;
 
-fn reference_span(reference: &Reference) -> SourceSpan {
-    let Some(first) = reference.path.first() else {
-        return SourceSpan::SYNTHETIC;
-    };
-    let Some(last) = reference.path.last() else {
-        return first.span;
-    };
+#[cfg(test)]
+#[path = "reference_dependency_tests.rs"]
+mod reference_dependency_tests;
 
-    SourceSpan::new(first.span.source, first.span.span.start, last.span.span.end)
-}
+#[cfg(test)]
+#[path = "provider_resolution_tests.rs"]
+mod provider_resolution_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        Attribute, Data, ExprKind, Parameter, ProviderConfig, Resource, Spanned, Value,
-    };
-    use crate::config::{SourceId, SourceSpan};
-    use std::collections::BTreeMap;
+    use crate::config::{ConfigReader, SourceId, TomlReader};
 
-    fn spanned(value: &str) -> Spanned<String> {
-        Spanned::synthetic(value.to_string())
-    }
-
-    fn reference(path: &[&str]) -> crate::config::Expr {
-        Spanned::synthetic(ExprKind::Reference(Reference {
-            path: path
-                .iter()
-                .map(|segment| Spanned::synthetic(segment.to_string()))
-                .collect(),
-        }))
-    }
-
-    fn attribute(name: &str, value: crate::config::Expr) -> Attribute {
-        Attribute {
-            name: spanned(name),
-            value,
-            span: SourceSpan::SYNTHETIC,
-        }
-    }
-
-    fn attrs(attributes: Vec<(&str, crate::config::Expr)>) -> Attributes {
-        attributes
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), attribute(name, value)))
-            .collect()
-    }
-
-    fn config() -> Config {
-        Config {
-            providers: vec![ProviderConfig {
-                name: spanned("blue"),
-                provider_type: spanned("blue"),
-                source: None,
-                default: None,
-                attributes: BTreeMap::new(),
-                span: SourceSpan::SYNTHETIC,
-            }],
-            parameters: vec![Parameter {
-                name: spanned("content"),
-                attributes: BTreeMap::new(),
-                span: SourceSpan::SYNTHETIC,
-            }],
-            resources: vec![Resource {
-                provider: spanned("blue"),
-                resource_type: spanned("file"),
-                name: spanned("config"),
-                attributes: BTreeMap::new(),
-                span: SourceSpan::SYNTHETIC,
-            }],
-            data: vec![Data {
-                provider: spanned("blue"),
-                data_type: spanned("script"),
-                name: spanned("setup"),
-                attributes: BTreeMap::new(),
-                span: SourceSpan::SYNTHETIC,
-            }],
-        }
+    fn config() -> ParsedConfig {
+        TomlReader
+            .read(
+                SourceId(3),
+                r#"
+[provider.app]
+type = "example"
+[parameter.app]
+default = "prod"
+[resource.server.app]
+provider = "app"
+[data.server.app]
+provider = "app"
+"#,
+            )
+            .unwrap()
     }
 
     #[test]
-    fn adds_provider_parameter_data_and_resource_nodes() {
-        let graph = DesiredGraphBuilder::build(&config()).unwrap();
-
-        assert!(graph.contains_node(&NodeId::Provider {
-            name: "blue".into()
-        }));
-        assert!(graph.contains_node(&NodeId::Parameter {
-            name: "content".into()
-        }));
-        assert!(graph.contains_node(&NodeId::Data {
-            data_type: "script".into(),
-            name: "setup".into()
-        }));
-        assert!(graph.contains_node(&NodeId::Resource {
-            resource_type: "file".into(),
-            name: "config".into()
-        }));
-    }
-
-    #[test]
-    fn adds_provider_edges_to_data_and_resource_nodes() {
-        let graph = DesiredGraphBuilder::build(&config()).unwrap();
-
-        assert!(graph.has_edge(
-            &NodeId::Provider {
-                name: "blue".into()
-            },
-            &NodeId::Data {
-                data_type: "script".into(),
-                name: "setup".into(),
-            },
-            &EdgeKind::Provider,
-        ));
-        assert!(graph.has_edge(
-            &NodeId::Provider {
-                name: "blue".into()
-            },
-            &NodeId::Resource {
-                resource_type: "file".into(),
-                name: "config".into(),
-            },
-            &EdgeKind::Provider,
-        ));
-    }
-
-    #[test]
-    fn stores_provider_metadata_on_data_and_resource_nodes() {
-        let graph = DesiredGraphBuilder::build(&config()).unwrap();
-
-        let data = graph
-            .node(&NodeId::Data {
-                data_type: "script".into(),
-                name: "setup".into(),
-            })
-            .unwrap();
-        assert_eq!(
-            data.kind,
-            GraphNodeKind::Data {
-                provider: "blue".into()
-            }
-        );
-
-        let resource = graph
-            .node(&NodeId::Resource {
-                resource_type: "file".into(),
-                name: "config".into(),
-            })
-            .unwrap();
-        assert_eq!(
-            resource.kind,
-            GraphNodeKind::Resource {
-                provider: "blue".into()
-            }
+    fn empty_config_registers_no_declarations() {
+        let config = ParsedConfig {
+            providers: vec![],
+            parameters: vec![],
+            resources: vec![],
+            data: vec![],
+        };
+        assert!(
+            DesiredGraphBuilder::build(&config)
+                .unwrap()
+                .topological_order()
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[test]
-    fn adds_resource_to_parameter_reference_edge() {
-        let mut config = config();
-        config.resources[0].attributes =
-            attrs(vec![("content", reference(&["parameter", "content"]))]);
-
+    fn registers_all_block_kinds_without_copying_them() {
+        let config = config();
         let graph = DesiredGraphBuilder::build(&config).unwrap();
-
-        assert!(graph.has_edge(
-            &NodeId::Parameter {
-                name: "content".into()
-            },
-            &NodeId::Resource {
-                resource_type: "file".into(),
-                name: "config".into(),
-            },
-            &EdgeKind::Reference,
-        ));
+        let declarations = [
+            Declaration::Provider(&config.providers[0]),
+            Declaration::Parameter(&config.parameters[0]),
+            Declaration::Resource(&config.resources[0]),
+            Declaration::Data(&config.data[0]),
+        ];
+        assert_eq!(graph.topological_order().unwrap().len(), declarations.len());
+        for original in declarations {
+            let found = graph.declaration(&original.id()).unwrap();
+            assert!(std::ptr::eq(found.attributes(), original.attributes()));
+            assert_eq!(found.span(), original.span());
+            let expected = match original {
+                Declaration::Resource(_) | Declaration::Data(_) => {
+                    vec![Declaration::Provider(&config.providers[0]).id()]
+                }
+                _ => vec![],
+            };
+            assert_eq!(graph.dependencies_of(&original.id()).unwrap(), expected);
+        }
     }
 
     #[test]
-    fn adds_resource_to_data_reference_edge() {
+    fn same_name_in_different_local_types_is_not_a_duplicate() {
         let mut config = config();
-        config.resources[0].attributes = attrs(vec![(
-            "script",
-            reference(&["data", "script", "setup", "output"]),
-        )]);
-
-        let graph = DesiredGraphBuilder::build(&config).unwrap();
-
-        assert!(graph.has_edge(
-            &NodeId::Data {
-                data_type: "script".into(),
-                name: "setup".into(),
-            },
-            &NodeId::Resource {
-                resource_type: "file".into(),
-                name: "config".into(),
-            },
-            &EdgeKind::Reference,
-        ));
+        let mut resource = config.resources[0].clone();
+        resource.resource_type.value = "database".into();
+        config.resources.push(resource);
+        let mut data = config.data[0].clone();
+        data.data_type.value = "database".into();
+        config.data.push(data);
+        assert_eq!(
+            DesiredGraphBuilder::build(&config)
+                .unwrap()
+                .topological_order()
+                .unwrap()
+                .len(),
+            6
+        );
     }
 
     #[test]
-    fn adds_resource_to_resource_reference_edge() {
+    fn collects_duplicates_in_every_block_kind_with_both_spans() {
         let mut config = config();
-        config.resources.push(Resource {
-            provider: spanned("blue"),
-            resource_type: spanned("file"),
-            name: spanned("other"),
-            attributes: attrs(vec![(
-                "path",
-                reference(&["resource", "file", "config", "id"]),
-            )]),
-            span: SourceSpan::SYNTHETIC,
+        let duplicate_span = SourceSpan::new(SourceId(8), 10, 20);
+        let expected = [
+            Declaration::Provider(&config.providers[0]),
+            Declaration::Parameter(&config.parameters[0]),
+            Declaration::Resource(&config.resources[0]),
+            Declaration::Data(&config.data[0]),
+        ]
+        .map(|declaration| GraphBuildError::DuplicateDeclaration {
+            id: declaration.id(),
+            first_span: declaration.span(),
+            duplicate_span,
         });
-
-        let graph = DesiredGraphBuilder::build(&config).unwrap();
-
-        assert!(graph.has_edge(
-            &NodeId::Resource {
-                resource_type: "file".into(),
-                name: "config".into(),
-            },
-            &NodeId::Resource {
-                resource_type: "file".into(),
-                name: "other".into(),
-            },
-            &EdgeKind::Reference,
-        ));
-    }
-
-    #[test]
-    fn deduplicates_duplicate_edges() {
-        let mut config = config();
-        config.resources[0].attributes = attrs(vec![
-            ("content_a", reference(&["parameter", "content"])),
-            ("content_b", reference(&["parameter", "content"])),
-        ]);
-
-        let graph = DesiredGraphBuilder::build(&config).unwrap();
-
-        assert_eq!(
-            graph.edge_count_between(
-                &NodeId::Parameter {
-                    name: "content".into()
-                },
-                &NodeId::Resource {
-                    resource_type: "file".into(),
-                    name: "config".into(),
-                },
-                &EdgeKind::Reference,
-            ),
-            1
-        );
-    }
-
-    #[test]
-    fn finds_references_in_nested_array_and_object_values() {
-        let mut nested = BTreeMap::new();
-        nested.insert(
-            "inner".into(),
-            attribute("inner", reference(&["parameter", "content"])),
-        );
-        let mut config = config();
-        config.resources[0].attributes = attrs(vec![
-            (
-                "array",
-                Spanned::synthetic(ExprKind::Literal(Value::Array(vec![reference(&[
-                    "data", "script", "setup",
-                ])]))),
-            ),
-            (
-                "object",
-                Spanned::synthetic(ExprKind::Literal(Value::Object(nested))),
-            ),
-        ]);
-
-        let graph = DesiredGraphBuilder::build(&config).unwrap();
-
-        assert!(graph.has_edge(
-            &NodeId::Data {
-                data_type: "script".into(),
-                name: "setup".into(),
-            },
-            &NodeId::Resource {
-                resource_type: "file".into(),
-                name: "config".into(),
-            },
-            &EdgeKind::Reference,
-        ));
-        assert!(graph.has_edge(
-            &NodeId::Parameter {
-                name: "content".into()
-            },
-            &NodeId::Resource {
-                resource_type: "file".into(),
-                name: "config".into(),
-            },
-            &EdgeKind::Reference,
-        ));
-    }
-
-    #[test]
-    fn unknown_reference_errors() {
-        let mut config = config();
-        config.resources[0].attributes =
-            attrs(vec![("content", reference(&["parameter", "missing"]))]);
-
+        let mut provider = config.providers[0].clone();
+        provider.span = duplicate_span;
+        let mut parameter = config.parameters[0].clone();
+        parameter.span = duplicate_span;
+        let mut resource = config.resources[0].clone();
+        resource.span = duplicate_span;
+        let mut data = config.data[0].clone();
+        data.span = duplicate_span;
+        config.providers.push(provider);
+        config.parameters.push(parameter);
+        config.resources.push(resource);
+        config.data.push(data);
         let errors = DesiredGraphBuilder::build(&config).unwrap_err();
-
-        assert!(matches!(
-            errors[0],
-            GraphBuildError::UnknownReference { .. }
-        ));
+        assert_eq!(errors, expected);
+        assert!(errors[0].to_string().contains("provider.app"));
     }
 
     #[test]
-    fn malformed_reference_errors() {
+    fn repeated_duplicates_preserve_first_declaration_and_continue_registration() {
         let mut config = config();
-        config.resources[0].attributes = attrs(vec![("content", reference(&["resource", "file"]))]);
-
-        let errors = DesiredGraphBuilder::build(&config).unwrap_err();
-
-        assert!(matches!(
-            errors[0],
-            GraphBuildError::MalformedReference { .. }
-        ));
-    }
-
-    #[test]
-    fn formats_node_ids() {
-        assert_eq!(
-            NodeId::Provider {
-                name: "blue".into()
-            }
-            .to_string(),
-            "provider.blue"
-        );
-        assert_eq!(
-            NodeId::Parameter {
-                name: "content".into()
-            }
-            .to_string(),
-            "parameter.content"
-        );
-        assert_eq!(
-            NodeId::Data {
-                data_type: "script".into(),
-                name: "setup".into(),
-            }
-            .to_string(),
-            "data.script.setup"
-        );
-        assert_eq!(
-            NodeId::Resource {
-                resource_type: "file".into(),
-                name: "config".into(),
-            }
-            .to_string(),
-            "resource.file.config"
-        );
-    }
-
-    #[test]
-    fn formats_graph_build_errors() {
-        assert_eq!(
-            GraphBuildError::MalformedReference {
-                path: vec!["resource".into(), "file".into()],
-                span: SourceSpan::SYNTHETIC,
-            }
-            .to_string(),
-            "malformed reference `resource.file`"
-        );
-        assert_eq!(
-            GraphBuildError::UnknownReference {
-                path: vec!["parameter".into(), "missing".into()],
-                span: SourceSpan::SYNTHETIC,
-            }
-            .to_string(),
-            "unknown reference `parameter.missing`"
-        );
-        assert_eq!(
-            GraphBuildError::Cycle {
-                path: vec![
-                    NodeId::Resource {
-                        resource_type: "file".into(),
-                        name: "a".into(),
-                    },
-                    NodeId::Resource {
-                        resource_type: "file".into(),
-                        name: "b".into(),
-                    },
-                    NodeId::Resource {
-                        resource_type: "file".into(),
-                        name: "a".into(),
-                    },
-                ],
-            }
-            .to_string(),
-            "dependency cycle detected: resource.file.a -> resource.file.b -> resource.file.a"
-        );
-    }
-
-    #[test]
-    fn topological_order_places_dependencies_before_dependents() {
-        let mut config = config();
-        config.resources[0].attributes =
-            attrs(vec![("script", reference(&["data", "script", "setup"]))]);
-        config.data[0].attributes = attrs(vec![("content", reference(&["parameter", "content"]))]);
-
-        let graph = DesiredGraphBuilder::build(&config).unwrap();
-        let order = graph.topological_order().unwrap();
-
-        let provider = order
-            .iter()
-            .position(|id| {
-                id == &NodeId::Provider {
-                    name: "blue".into(),
-                }
-            })
-            .unwrap();
-        let parameter = order
-            .iter()
-            .position(|id| {
-                id == &NodeId::Parameter {
-                    name: "content".into(),
-                }
-            })
-            .unwrap();
-        let data = order
-            .iter()
-            .position(|id| {
-                id == &NodeId::Data {
-                    data_type: "script".into(),
-                    name: "setup".into(),
-                }
-            })
-            .unwrap();
-        let resource = order
-            .iter()
-            .position(|id| {
-                id == &NodeId::Resource {
-                    resource_type: "file".into(),
-                    name: "config".into(),
-                }
-            })
-            .unwrap();
-
-        assert!(provider < data);
-        assert!(provider < resource);
-        assert!(parameter < data);
-        assert!(data < resource);
-    }
-
-    #[test]
-    fn topological_order_returns_cycle_path() {
+        let first_span = config.parameters[0].span;
+        let mut duplicate = config.parameters[0].clone();
+        duplicate.span = SourceSpan::new(SourceId(4), 10, 20);
+        config.parameters.push(duplicate.clone());
+        duplicate.span = SourceSpan::new(SourceId(5), 30, 40);
+        config.parameters.push(duplicate);
         let mut graph = DesiredGraph::new();
-        let a = NodeId::Resource {
-            resource_type: "file".into(),
-            name: "a".into(),
+        let errors = register_declarations(&config, &mut graph).unwrap_err();
+        assert_eq!(errors.len(), 2);
+        for error in errors {
+            let GraphBuildError::DuplicateDeclaration {
+                first_span: reported,
+                ..
+            } = error
+            else {
+                panic!("expected duplicate declaration")
+            };
+            assert_eq!(reported, first_span);
+        }
+        let id = Declaration::Parameter(&config.parameters[0]).id();
+        let Declaration::Parameter(found) = graph.declaration(&id).unwrap() else {
+            panic!("expected parameter")
         };
-        let b = NodeId::Resource {
-            resource_type: "file".into(),
-            name: "b".into(),
-        };
-        graph.add_node(GraphNode {
-            id: a.clone(),
-            kind: GraphNodeKind::Resource {
-                provider: "blue".into(),
-            },
-        });
-        graph.add_node(GraphNode {
-            id: b.clone(),
-            kind: GraphNodeKind::Resource {
-                provider: "blue".into(),
-            },
-        });
-        graph.add_edge(&a, &b, EdgeKind::Reference);
-        graph.add_edge(&b, &a, EdgeKind::Reference);
-
-        let cycle = graph.topological_order().unwrap_err();
-
-        assert_eq!(cycle.first(), cycle.last());
-        assert!(cycle.contains(&a));
-        assert!(cycle.contains(&b));
-    }
-
-    #[test]
-    fn acyclic_graph_succeeds() {
-        let mut config = config();
-        config.resources.push(Resource {
-            provider: spanned("blue"),
-            resource_type: spanned("file"),
-            name: spanned("other"),
-            attributes: attrs(vec![("path", reference(&["resource", "file", "config"]))]),
-            span: SourceSpan::SYNTHETIC,
-        });
-
-        assert!(DesiredGraphBuilder::build(&config).is_ok());
-    }
-
-    #[test]
-    fn cycle_errors_with_full_path() {
-        let mut config = config();
-        config.resources[0].attributes =
-            attrs(vec![("path", reference(&["resource", "file", "other"]))]);
-        config.resources.push(Resource {
-            provider: spanned("blue"),
-            resource_type: spanned("file"),
-            name: spanned("other"),
-            attributes: attrs(vec![("path", reference(&["resource", "file", "config"]))]),
-            span: SourceSpan::SYNTHETIC,
-        });
-
-        let errors = DesiredGraphBuilder::build(&config).unwrap_err();
-        let cycle = errors
-            .iter()
-            .find_map(|error| match error {
-                GraphBuildError::Cycle { path } => Some(path),
-                _ => None,
-            })
-            .expect("expected cycle error");
-
-        assert_eq!(cycle.first(), cycle.last());
-        assert!(cycle.contains(&NodeId::Resource {
-            resource_type: "file".into(),
-            name: "config".into(),
-        }));
-        assert!(cycle.contains(&NodeId::Resource {
-            resource_type: "file".into(),
-            name: "other".into(),
-        }));
-        assert_eq!(cycle.len(), 3);
-    }
-
-    #[test]
-    fn reference_span_covers_reference_path() {
-        let reference = Reference {
-            path: vec![
-                Spanned::new("parameter".into(), SourceSpan::new(SourceId(0), 10, 19)),
-                Spanned::new("content".into(), SourceSpan::new(SourceId(0), 20, 27)),
-            ],
-        };
-
-        assert_eq!(
-            reference_span(&reference),
-            SourceSpan::new(SourceId(0), 10, 27)
+        assert!(std::ptr::eq(found, &config.parameters[0]));
+        assert!(
+            graph
+                .declaration(&Declaration::Resource(&config.resources[0]).id())
+                .is_ok()
         );
+        assert!(
+            graph
+                .declaration(&Declaration::Data(&config.data[0]).id())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn registration_does_not_resolve_providers_or_references() {
+        let config = TomlReader
+            .read(
+                SourceId(0),
+                r#"
+[resource.server.app]
+provider = "not_declared"
+name = "{{ parameter.not_declared }}"
+"#,
+            )
+            .unwrap();
+        let mut graph = DesiredGraph::new();
+        register_declarations(&config, &mut graph).unwrap();
+        let id = Declaration::Resource(&config.resources[0]).id();
+        assert!(graph.dependencies_of(&id).unwrap().is_empty());
+        assert_eq!(graph.provider_for(&id).unwrap(), None);
     }
 }

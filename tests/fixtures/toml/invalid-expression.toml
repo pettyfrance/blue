@@ -1,0 +1,2 @@
+[parameter.test]
+default = { "é" = "{{ parameter. }}" }
